@@ -28,7 +28,7 @@ python -m pip install numpy pandas scipy scikit-learn matplotlib plotly streamli
 ## Run the backtester
 
 ```bash
-python 04-backtest/backtester.py --prices 01-data/prices.txt --strategy 03-strategy/strategy.py --start-day 1 --end-day 499
+python 04-backtest/backtester.py --prices 01-data/prices.txt --strategy 03-strategy/strategy.py --start-day 500 --end-day 749
 ```
 
 ## Run the dashboard
