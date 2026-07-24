@@ -1,39 +1,11 @@
+
 import numpy as np
 
-
 N_INST = 51
-MAX_POS_ALGO = 100_000
-MAX_POS_ELSE = 10_000
+MAX_POS_ALGO, MAX_POS_ELSE = 100_000, 10_000
+BET_POS_ALGO, BET_POS_ELSE = 10_000, 1_000
+PAIRS_WINDOW, PAIRS_THRESHOLD = 40, 0.0
 
-# Parameters
-BET_POS_ALGO = 100_000
-BET_POS_ELSE = 10_000
-WINDOW = 40
-WINDOW_INDIVIDUAL = 40
-Z_THRESHOLD = 0
-Z_INDIVIDUAL = 2
-
-currentPos = np.zeros(N_INST, dtype=int)
-
-good_pairs = [
-    ["AENO", "NWIG"],
-    ["SMAH", "ILVX"],
-    ["ACIX", "ITPA"],
-    ["MHRM", "EAFC"],
-    ["EORC", "NGTE"],
-    ["NPCK", "SRTX"],
-    ["HUXZ", "ACAC"],
-    ["HETT", "ULXY"],
-    ["FWWG", "BLBT"],
-    ["NAYO", "EELT"],
-    ["ALUT", "CCNS"],
-    ["RRES", "CTGI"]
-]
-# good_pairs = [["FWWG", "BLBT"]]
-individual = []
-
-
-# Must match the row order of prcSoFar exactly.
 INSTRUMENTS = [
     "ALGO", "AENO", "LSST", "SRNA", "ELLT", "AMRP", "OTCS", "HETT",
     "HUXZ", "DUCT", "SMAH", "NPCK", "MSDP", "EORC", "CUBO", "HRET",
@@ -44,268 +16,74 @@ INSTRUMENTS = [
     "FARS", "MHRM", "EAFC",
 ]
 
+PAIRS = [
+    ("AENO", "NWIG"), ("SMAH", "ILVX"), ("ACIX", "ITPA"), ("MHRM", "EAFC"),
+    ("EORC", "NGTE"), ("NPCK", "SRTX"), ("HUXZ", "ACAC"), ("HETT", "ULXY"),
+    ("FWWG", "BLBT"), ("NAYO", "EELT"), ("ALUT", "CCNS"), ("RRES", "CTGI"),
+]
+
+INDEX = {name: i for i, name in enumerate(INSTRUMENTS)}
+PAIRED = {name for pair in PAIRS for name in pair}
+INDIVIDUAL = [name for name in INSTRUMENTS if name not in PAIRED]
+currentPos = np.zeros(N_INST, dtype=int)
+
+
 def position_limits(instrument_name):
-    """Return bet size and maximum position for an instrument."""
-    if instrument_name == "ALGO":
-        return BET_POS_ALGO, MAX_POS_ALGO
-
-    return BET_POS_ELSE, MAX_POS_ELSE
+    return ((BET_POS_ALGO, MAX_POS_ALGO) if instrument_name == "ALGO"
+            else (BET_POS_ELSE, MAX_POS_ELSE))
 
 
-def pairs_strategy(prcSoFar, instrument_index):
-    """
-    Trade residual mean reversion for each pair.
-
-    Individual dollar exposures are proportional to (1, beta), with the
-    larger leg capped at BET_POS_ELSE or BET_POS_ALGO.
-    """
-    nins, nt = prcSoFar.shape
-    target = np.zeros(nins, dtype=float)
-
-    if nt < WINDOW:
+def Trade_pairs(prices):
+    target = np.zeros(N_INST, dtype=int)
+    if prices.shape[1] < PAIRS_WINDOW:
         return target
 
-    for y_name, x_name in good_pairs:
-        y_idx = instrument_index[y_name]
-        x_idx = instrument_index[x_name]
+    for y_name, x_name in PAIRS:
+        yi, xi = INDEX[y_name], INDEX[x_name]
+        y, x = prices[yi, -PAIRS_WINDOW:], prices[xi, -PAIRS_WINDOW:]
 
-        y = np.asarray(
-            prcSoFar[y_idx, -WINDOW:],
-            dtype=float,
-        )
-        x = np.asarray(
-            prcSoFar[x_idx, -WINDOW:],
-            dtype=float,
-        )
-
-        if (
-            not np.isfinite(y).all()
-            or not np.isfinite(x).all()
-            or (y <= 0).any()
-            or (x <= 0).any()
-        ):
+        if not (np.isfinite(x).all() and np.isfinite(y).all()):
             continue
 
-        # Rolling OLS: y = alpha + beta*x + residual.
-        design = np.column_stack((
-            np.ones(WINDOW),
-            x,
-        ))
-
-        alpha, beta = np.linalg.lstsq(
-            design,
-            y,
-            rcond=None,
-        )[0]
-
-        if not np.isfinite(beta):
+        x_centered, y_centered = x - x.mean(), y - y.mean()
+        variance = x_centered @ x_centered
+        if variance <= np.finfo(float).eps:
             continue
 
-        residuals = y - (alpha + beta * x)
-        residual_mean = residuals.mean()
-        residual_std = residuals.std(ddof=2)
-
-        if (
-            not np.isfinite(residual_std)
-            or residual_std <= np.finfo(float).eps
-        ):
+        beta = (x_centered @ y_centered) / variance
+        residual = y_centered - beta * x_centered
+        std = residual.std()
+        if not np.isfinite(beta) or std <= np.finfo(float).eps:
             continue
 
-        z_score = (
-            residuals[-1] - residual_mean
-        ) / residual_std
-
-        if (
-            not np.isfinite(z_score)
-            or abs(z_score) < Z_THRESHOLD
-        ):
+        zscore = residual[-1] / std
+        if abs(zscore) <= PAIRS_THRESHOLD:
             continue
 
-        # Positive residual: short y, take opposite beta-weighted x leg.
-        # Negative residual: long y, take opposite beta-weighted x leg.
-        y_direction = -np.sign(z_score)
+        direction = -np.sign(zscore)
+        bet = min(position_limits(y_name)[0], position_limits(x_name)[0])
+        scale = bet / max(1.0, abs(beta))
 
-        if "ALGO" in (y_name, x_name):
-            max_exposure = BET_POS_ALGO
-            max_position = MAX_POS_ALGO
-        else:
-            max_exposure = BET_POS_ELSE
-            max_position = MAX_POS_ELSE
+        target[yi] = int(np.rint(direction * scale))
+        target[xi] = int(np.rint(-direction * beta * scale))
 
-        # Raw dollar exposure weights are:
-        #
-        #     y:  1
-        #     x: -beta
-        #
-        # Normalize so the largest individual dollar exposure is exactly
-        # max_exposure.
-        exposure_scale = max(1.0, abs(beta))
-
-        y_dollar_exposure = (
-            y_direction
-            * max_exposure
-            / exposure_scale
-        )
-
-        x_dollar_exposure = (
-            -y_direction
-            * beta
-            * max_exposure
-            / exposure_scale
-        )
-
-        # Convert dollar exposures into instrument quantities.
-        y_position = y_dollar_exposure / y[-1]
-        x_position = x_dollar_exposure / x[-1]
-
-        # If a quantity limit is reached, scale both legs together so the
-        # beta relationship remains unchanged.
-        position_scale = 1.0
-
-        if abs(y_position) > max_position:
-            position_scale = min(
-                position_scale,
-                max_position / abs(y_position),
-            )
-
-        if abs(x_position) > max_position:
-            position_scale = min(
-                position_scale,
-                max_position / abs(x_position),
-            )
-
-        y_position *= position_scale
-        x_position *= position_scale
-
-        target[y_idx] += y_position
-        target[x_idx] += x_position
+        target[yi] = np.clip(target[yi], -position_limits(y_name)[1],
+                             position_limits(y_name)[1])
+        target[xi] = np.clip(target[xi], -position_limits(x_name)[1],
+                             position_limits(x_name)[1])
 
     return target
 
 
-def individual_strategy(prcSoFar, instrument_index):
-    """
-    Generate return mean-reversion positions for `individual`.
-
-    The latest simple return is compared with the mean and standard
-    deviation of the preceding WINDOW_INDIVIDUAL returns.
-
-    A positive return z-score produces a short position.
-    A negative return z-score produces a long position.
-    """
-    nins, nt = prcSoFar.shape
-    target = np.zeros(nins, dtype=float)
-
-    # Need:
-    #   WINDOW_INDIVIDUAL historical returns
-    #   1 current return
-    # Therefore, we need WINDOW_INDIVIDUAL + 2 prices.
-    required_prices = WINDOW_INDIVIDUAL + 2
-
-    if nt < required_prices:
-        return target
-
-    for instrument_name in individual:
-        idx = instrument_index[instrument_name]
-
-        prices = np.asarray(
-            prcSoFar[idx, -required_prices:],
-            dtype=float,
-        )
-
-        if (
-            not np.isfinite(prices).all()
-            or (prices <= 0).any()
-        ):
-            continue
-
-        returns = prices[1:] / prices[:-1] - 1.0
-
-        # Use only returns known before the latest return to estimate
-        # its expected value and volatility.
-        historical_returns = returns[:-1]
-        current_return = returns[-1]
-
-        return_mean = historical_returns.mean()
-        return_std = historical_returns.std(ddof=1)
-
-        if (
-            not np.isfinite(return_std)
-            or return_std <= np.finfo(float).eps
-        ):
-            continue
-
-        z_score = (
-            current_return - return_mean
-        ) / return_std
-
-        if (
-            not np.isfinite(z_score)
-            or abs(z_score) < Z_INDIVIDUAL
-        ):
-            continue
-
-        # Mean reversion:
-        # unusually positive return -> short
-        # unusually negative return -> long
-        direction = -np.sign(z_score)
-
-        bet_size, max_position = position_limits(
-            instrument_name
-        )
-
-        position = (
-            direction
-            * bet_size
-            / prices[-1]
-        )
-
-        target[idx] += np.clip(
-            position,
-            -max_position,
-            max_position,
-        )
-
-    return target
+def Trade_individual():
+    return np.zeros(N_INST, dtype=int)
 
 
 def getMyPosition(prcSoFar):
-    """Combine pair and individual strategy target positions."""
     global currentPos
+    prices = np.asarray(prcSoFar, dtype=float)
+    if prices.ndim != 2 or prices.shape[0] != N_INST:
+        raise ValueError(f"prcSoFar must have shape ({N_INST}, observations)")
 
-    nins, _ = prcSoFar.shape
-
-    if nins != len(INSTRUMENTS):
-        raise ValueError(
-            f"Expected {len(INSTRUMENTS)} instruments, "
-            f"but prcSoFar contains {nins}"
-        )
-
-    instrument_index = {
-        name: index
-        for index, name in enumerate(INSTRUMENTS)
-    }
-
-    pair_targets = pairs_strategy(
-        prcSoFar,
-        instrument_index,
-    )
-    individual_targets = individual_strategy(
-        prcSoFar,
-        instrument_index,
-    )
-
-    target = pair_targets + individual_targets
-
-    # Enforce final limits after combining strategies.
-    for name, idx in instrument_index.items():
-        _, max_position = position_limits(name)
-
-        target[idx] = np.clip(
-            target[idx],
-            -max_position,
-            max_position,
-        )
-
-    currentPos = np.rint(target).astype(int)
-    return currentPos
+    currentPos = Trade_pairs(prices) + Trade_individual()
+    return currentPos.copy()

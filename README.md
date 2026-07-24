@@ -96,3 +96,6 @@ python -m pip freeze > requirements-dev.txt
 ```
 
 The competition submission should contain only the self-contained team Python file and, if required, a separate `requirements.txt` listing packages outside the competition's standard environment.
+
+IF in root folder, run:
+python3 04-backtest/backtester.py --prices 01-data/prices.txt --strategy 03-strategy/strategy.py --start-day 1 --end-day 499
