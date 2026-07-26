@@ -1502,3 +1502,420 @@ def adaptive_majority_return_forecast(
         diagnostics["figure"] = fig
 
     return tomorrow_forecast, diagnostics
+
+Pair = tuple[Hashable, Hashable]
+
+
+@dataclass(frozen=True)
+class OLSWindowSelection:
+    """Immutable output from :func:`select_ols_window`.
+
+    Attributes
+    ----------
+    selected_window:
+        Longest eligible window within one standard error of the best mean
+        fold score.
+    window_summary:
+        One row per candidate window, including the cross-pair/fold score.
+    fold_results:
+        Diagnostics for every pair, window and chronological test fold.
+    daily_results:
+        Causal residuals, z-scores, positions and net strategy returns.
+    """
+
+    selected_window: int
+    window_summary: pd.DataFrame
+    fold_results: pd.DataFrame
+    daily_results: pd.DataFrame
+
+
+def _validate_inputs(
+    prices: pd.DataFrame,
+    pairs: Sequence[Pair],
+    windows: Sequence[int],
+    *,
+    zscore_window: int,
+    fold_size: int,
+    annualization: int,
+    entry_z: float,
+    exit_z: float,
+    transaction_cost_bps: float,
+    minimum_trades: int,
+) -> tuple[pd.DataFrame, tuple[Pair, ...], tuple[int, ...]]:
+    """Validate and normalize public inputs."""
+    if not isinstance(prices, pd.DataFrame):
+        raise TypeError("prices must be a pandas DataFrame")
+    if prices.empty or prices.shape[1] < 2:
+        raise ValueError("prices must contain observations for at least two instruments")
+    if not prices.index.is_monotonic_increasing or not prices.index.is_unique:
+        raise ValueError("prices index must be unique and ordered chronologically")
+    if not prices.columns.is_unique:
+        raise ValueError("prices columns must be unique")
+
+    try:
+        clean_prices = prices.astype(float).copy()
+    except (TypeError, ValueError) as exc:
+        raise TypeError("prices must contain numeric values") from exc
+    values = clean_prices.to_numpy()
+    if np.isinf(values).any():
+        raise ValueError("prices must not contain infinite values")
+    if (clean_prices <= 0).any().any():
+        raise ValueError("log-price OLS requires strictly positive prices")
+
+    normalized_pairs = tuple(tuple(pair) for pair in pairs)
+    if not normalized_pairs:
+        raise ValueError("pairs must not be empty")
+    if any(len(pair) != 2 or pair[0] == pair[1] for pair in normalized_pairs):
+        raise ValueError("each pair must contain two different instruments")
+    missing = {
+        instrument
+        for pair in normalized_pairs
+        for instrument in pair
+        if instrument not in clean_prices.columns
+    }
+    if missing:
+        raise KeyError(f"unknown instruments: {sorted(missing, key=str)}")
+    if len(set(normalized_pairs)) != len(normalized_pairs):
+        raise ValueError("pairs must not contain duplicates")
+
+    normalized_windows: list[int] = []
+    for window in windows:
+        if isinstance(window, bool) or not isinstance(window, (int, np.integer)):
+            raise TypeError("windows must contain integers")
+        if int(window) < 3:
+            raise ValueError("each OLS window must be at least 3")
+        normalized_windows.append(int(window))
+    if not normalized_windows:
+        raise ValueError("windows must not be empty")
+    normalized_windows = sorted(set(normalized_windows))
+
+    integer_parameters = {
+        "zscore_window": zscore_window,
+        "fold_size": fold_size,
+        "annualization": annualization,
+        "minimum_trades": minimum_trades,
+    }
+    for name, value in integer_parameters.items():
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"{name} must be an integer")
+        if int(value) <= 0:
+            raise ValueError(f"{name} must be positive")
+    if zscore_window < 2:
+        raise ValueError("zscore_window must be at least 2")
+    if not np.isfinite(entry_z) or entry_z <= 0:
+        raise ValueError("entry_z must be positive and finite")
+    if not np.isfinite(exit_z) or exit_z < 0 or exit_z >= entry_z:
+        raise ValueError("exit_z must satisfy 0 <= exit_z < entry_z")
+    if not np.isfinite(transaction_cost_bps) or transaction_cost_bps < 0:
+        raise ValueError("transaction_cost_bps must be non-negative and finite")
+
+    required = max(normalized_windows) + zscore_window + fold_size + 1
+    if len(clean_prices) < required:
+        raise ValueError(
+            f"prices has {len(clean_prices)} rows; at least {required} are required "
+            "for the largest window, z-score history and one test fold"
+        )
+    return clean_prices, normalized_pairs, tuple(normalized_windows)
+
+
+def _causal_rolling_ols(
+    y: pd.Series,
+    x: pd.Series,
+    window: int,
+) -> pd.DataFrame:
+    """Return one-step-ahead rolling OLS parameters and residuals."""
+    # Shift first: the estimate at t uses [t-window, ..., t-1].
+    y_lagged = y.shift(1)
+    x_lagged = x.shift(1)
+    x_roll = x_lagged.rolling(window, min_periods=window)
+    y_roll = y_lagged.rolling(window, min_periods=window)
+    variance = x_roll.var(ddof=1)
+    beta = y_roll.cov(x_lagged) / variance
+    beta = beta.where(variance > np.finfo(float).eps)
+    alpha = y_roll.mean() - beta * x_roll.mean()
+    residual = y - alpha - beta * x
+    return pd.DataFrame({"alpha": alpha, "beta": beta, "residual": residual})
+
+
+def _causal_zscore(residual: pd.Series, window: int) -> pd.Series:
+    """Standardize residuals using only prior residual observations."""
+    history = residual.shift(1).rolling(window, min_periods=window)
+    mean = history.mean()
+    standard_deviation = history.std(ddof=1)
+    return ((residual - mean) / standard_deviation).where(
+        standard_deviation > np.finfo(float).eps
+    )
+
+
+def _positions_from_zscore(
+    zscore: pd.Series,
+    *,
+    entry_z: float,
+    exit_z: float,
+) -> pd.Series:
+    """Create a deterministic, close-to-close mean-reversion position."""
+    positions = np.zeros(len(zscore), dtype=float)
+    current = 0.0
+    for location, value in enumerate(zscore.to_numpy(dtype=float)):
+        if not np.isfinite(value):
+            current = 0.0
+        elif current == 0.0:
+            if value >= entry_z:
+                current = -1.0
+            elif value <= -entry_z:
+                current = 1.0
+        elif abs(value) <= exit_z or np.sign(value) == current:
+            current = 0.0
+        positions[location] = current
+    return pd.Series(positions, index=zscore.index, name="position")
+
+
+def _daily_pair_results(
+    log_prices: pd.DataFrame,
+    pair: Pair,
+    window: int,
+    *,
+    zscore_window: int,
+    entry_z: float,
+    exit_z: float,
+    transaction_cost_bps: float,
+) -> pd.DataFrame:
+    """Backtest one pair/window with lagged signals and normalized exposure."""
+    dependent, independent = pair
+    y = log_prices[dependent]
+    x = log_prices[independent]
+    model = _causal_rolling_ols(y, x, window)
+    zscore = _causal_zscore(model["residual"], zscore_window)
+    desired_position = _positions_from_zscore(
+        zscore, entry_z=entry_z, exit_z=exit_z
+    )
+
+    # A signal observed at close t earns the close-to-close return t -> t+1.
+    held_position = desired_position.shift(1).fillna(0.0)
+    held_beta = model["beta"].shift(1)
+    y_return = y.diff()
+    x_return = x.diff()
+    gross_return = (
+        held_position
+        * (y_return - held_beta * x_return)
+        / (1.0 + held_beta.abs())
+    )
+
+    turnover = desired_position.diff().abs().fillna(desired_position.abs())
+    costs = turnover.shift(1).fillna(0.0) * transaction_cost_bps / 10_000.0
+    net_return = gross_return - costs
+    trade_entry = (
+        desired_position.ne(0.0)
+        & desired_position.shift(1, fill_value=0.0).eq(0.0)
+    )
+
+    return model.assign(
+        zscore=zscore,
+        desired_position=desired_position,
+        held_position=held_position,
+        gross_return=gross_return,
+        turnover=turnover,
+        cost=costs,
+        net_return=net_return,
+        trade_entry=trade_entry.astype(int),
+    )
+
+
+def _fold_statistics(
+    daily: pd.DataFrame,
+    *,
+    fold_size: int,
+    annualization: int,
+    minimum_trades: int,
+) -> list[dict[str, float | int | bool]]:
+    """Calculate non-overlapping chronological fold statistics."""
+    valid = daily.dropna(subset=["net_return", "residual", "beta"])
+    if valid.empty:
+        return []
+
+    records: list[dict[str, float | int | bool]] = []
+    for fold_number, start in enumerate(range(0, len(valid), fold_size)):
+        fold = valid.iloc[start : start + fold_size]
+        if len(fold) < fold_size:
+            break
+
+        returns = fold["net_return"]
+        volatility = float(returns.std(ddof=1))
+        sharpe = (
+            float(np.sqrt(annualization) * returns.mean() / volatility)
+            if volatility > np.finfo(float).eps
+            else np.nan
+        )
+        wealth = (1.0 + returns).cumprod()
+        drawdown = wealth / wealth.cummax() - 1.0
+        trades = int(fold["trade_entry"].sum())
+        beta_mean = float(fold["beta"].abs().mean())
+        beta_instability = float(fold["beta"].diff().abs().mean())
+        beta_instability /= max(beta_mean, np.finfo(float).eps)
+        crossings = int(
+            np.sign(fold["residual"])
+            .diff()
+            .abs()
+            .fillna(0.0)
+            .gt(0.0)
+            .sum()
+        )
+        eligible = trades >= minimum_trades and np.isfinite(sharpe)
+        records.append(
+            {
+                "fold": fold_number,
+                "start": fold.index[0],
+                "end": fold.index[-1],
+                "observations": len(fold),
+                "trades": trades,
+                "crossings": crossings,
+                "net_return": float(wealth.iloc[-1] - 1.0),
+                "sharpe": sharpe,
+                "maximum_drawdown": float(drawdown.min()),
+                "turnover": float(fold["turnover"].sum()),
+                "beta_instability": beta_instability,
+                "eligible": eligible,
+            }
+        )
+    return records
+
+
+def select_ols_window(
+    prices: pd.DataFrame,
+    pairs: Sequence[Pair],
+    *,
+    windows: Sequence[int] = (20, 40, 60, 80, 120, 250),
+    zscore_window: int = 20,
+    fold_size: int = 63,
+    annualization: int = 252,
+    entry_z: float = 2.0,
+    exit_z: float = 0.5,
+    transaction_cost_bps: float = 5.0,
+    minimum_trades: int = 2,
+) -> OLSWindowSelection:
+    """Select a global rolling-OLS window with chronological validation.
+
+    Prices are converted to logs internally.  Each candidate is evaluated with
+    the same causal mean-reversion strategy.  Fold score is net Sharpe; only
+    folds meeting ``minimum_trades`` are eligible.  Window-level results pool
+    eligible pair/fold observations.
+
+    Selection uses the one-standard-error rule: among candidates whose mean
+    score is no more than one standard error below the highest mean score,
+    choose the longest window.  This favors hedge-ratio stability when observed
+    performance is statistically indistinguishable.
+    """
+    clean_prices, normalized_pairs, normalized_windows = _validate_inputs(
+        prices,
+        pairs,
+        windows,
+        zscore_window=zscore_window,
+        fold_size=fold_size,
+        annualization=annualization,
+        entry_z=entry_z,
+        exit_z=exit_z,
+        transaction_cost_bps=transaction_cost_bps,
+        minimum_trades=minimum_trades,
+    )
+    log_prices = np.log(clean_prices)
+    # Compare every candidate over exactly the same calendar observations.
+    # Short windows must not receive extra, earlier folds unavailable to long
+    # windows, as that would confound window length with market regime.
+    common_evaluation_start = max(normalized_windows) + zscore_window
+
+    daily_frames: list[pd.DataFrame] = []
+    fold_records: list[dict[str, object]] = []
+    for dependent, independent in normalized_pairs:
+        for window in normalized_windows:
+            daily = _daily_pair_results(
+                log_prices,
+                (dependent, independent),
+                window,
+                zscore_window=zscore_window,
+                entry_z=entry_z,
+                exit_z=exit_z,
+                transaction_cost_bps=transaction_cost_bps,
+            )
+            daily.insert(0, "window", window)
+            daily.insert(0, "independent", independent)
+            daily.insert(0, "dependent", dependent)
+            daily_frames.append(daily)
+
+            for record in _fold_statistics(
+                daily.iloc[common_evaluation_start:],
+                fold_size=fold_size,
+                annualization=annualization,
+                minimum_trades=minimum_trades,
+            ):
+                fold_records.append(
+                    {
+                        "dependent": dependent,
+                        "independent": independent,
+                        "window": window,
+                        **record,
+                    }
+                )
+
+    if not fold_records:
+        raise ValueError("no complete validation folds could be constructed")
+
+    fold_results = pd.DataFrame.from_records(fold_records)
+    eligible = fold_results.loc[fold_results["eligible"]].copy()
+    if eligible.empty:
+        raise ValueError(
+            "no fold met minimum_trades; reduce minimum_trades, entry_z, or fold_size"
+        )
+
+    grouped = eligible.groupby("window", sort=True)
+    summary = grouped.agg(
+        eligible_folds=("sharpe", "size"),
+        mean_fold_sharpe=("sharpe", "mean"),
+        median_fold_sharpe=("sharpe", "median"),
+        fold_sharpe_std=("sharpe", "std"),
+        worst_fold_sharpe=("sharpe", "min"),
+        mean_maximum_drawdown=("maximum_drawdown", "mean"),
+        total_trades=("trades", "sum"),
+        mean_turnover=("turnover", "mean"),
+        mean_beta_instability=("beta_instability", "mean"),
+    )
+    summary = summary.reindex(normalized_windows)
+    summary["standard_error"] = (
+        summary["fold_sharpe_std"]
+        .fillna(0.0)
+        / np.sqrt(summary["eligible_folds"])
+    )
+    summary["eligible"] = summary["eligible_folds"].fillna(0).gt(0)
+
+    available = summary.loc[summary["eligible"]]
+    best_window = int(available["mean_fold_sharpe"].idxmax())
+    cutoff = float(
+        available.loc[best_window, "mean_fold_sharpe"]
+        - available.loc[best_window, "standard_error"]
+    )
+    summary["within_one_standard_error"] = (
+        summary["eligible"] & summary["mean_fold_sharpe"].ge(cutoff)
+    )
+    selected_window = int(
+        summary.index[summary["within_one_standard_error"]].max()
+    )
+    summary["selected"] = summary.index == selected_window
+    summary.index.name = "window"
+
+    daily_results = pd.concat(daily_frames, axis=0)
+    daily_results = daily_results.set_index(
+        ["dependent", "independent", "window"], append=True
+    ).reorder_levels(["dependent", "independent", "window", daily_results.index.name])
+    daily_results.index.names = [
+        "dependent",
+        "independent",
+        "window",
+        "observation",
+    ]
+
+    return OLSWindowSelection(
+        selected_window=selected_window,
+        window_summary=summary,
+        fold_results=fold_results,
+        daily_results=daily_results.sort_index(),
+    )
+

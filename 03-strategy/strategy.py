@@ -27,7 +27,7 @@ INSTRUMENTS = [
 # =============================================================================
 
 BET_POS_ALGO, BET_POS_ELSE = 10_000, 10_000
-PAIRS_WINDOW, PAIRS_THRESHOLD = 40, 0.0
+PAIRS_WINDOW, PAIRS_THRESHOLD = 250, 0.0
 
 # Rank instruments by their return over this lookback.
 INDIVIDUAL_WINDOW = 20
@@ -45,19 +45,16 @@ ALL_PAIRS = [
     ('NPCK', 'SRTX'), ('FWWG', 'BLBT'), ('SRNA', 'IHOZ'), ('CTGI', 'EELT'), 
     ('HETT', 'ULXY'), ('RTTH', 'RRES'), ('MTNS', 'HTRK'), ('DUCT', 'GARI'), 
     ('MSDP', 'SPLZ'), ('ELLT', 'DIHO'), ('RCRI', 'NAYO'), ('HRND', 'AETS'), 
-    ('MDGI', 'AGVF'), ('AMRP', 'FCSG'), ('LSST', 'HRET'), ('CUBO', 'ANSO'), ('OTCS', 'MMBT')]
-
-ALL_PAIRS_2 = [
-    ('MHRM', 'EAFC'), ('ACIX', 'ITPA'), ('EORC', 'NGTE'), ('AENO', 'NWIG'), 
-    ('SMAH', 'ILVX'), ('HUXZ', 'ACAC'), ('FWWG', 'BLBT'), ('CTGI', 'EELT')]
-
-PAIRS = [
-    ("AENO", "NWIG"), ("SMAH", "ILVX"), ("ACIX", "ITPA"), ("MHRM", "EAFC"),
-    ("EORC", "NGTE"), ("NPCK", "SRTX"), ("HUXZ", "ACAC"), ("HETT", "ULXY"),
-    ("FWWG", "BLBT"), ("NAYO", "EELT"), ("ALUT", "CCNS"), ("RRES", "CTGI"),
+    ('MDGI', 'AGVF'), ('AMRP', 'FCSG'), ('LSST', 'HRET'), ('CUBO', 'ANSO'), ('OTCS', 'MMBT')
 ]
 
-PAIRS = ALL_PAIRS_2
+PAIRS_1 = [
+    ('MHRM', 'EAFC'), ('ACIX', 'ITPA'), ('EORC', 'NGTE'), ('AENO', 'NWIG'), 
+    ('SMAH', 'ILVX'), ('HUXZ', 'ACAC'), ('ALUT', 'CCNS'), ('FWWG', 'BLBT'), 
+    ('CTGI', 'EELT'), ('HETT', 'ULXY'), ('RTTH', 'RRES'), ('RCRI', 'NAYO'), 
+]
+
+PAIRS = PAIRS_1
 
 INDEX = {name: i for i, name in enumerate(INSTRUMENTS)}
 PAIRED = {name for pair in PAIRS for name in pair}
@@ -152,14 +149,14 @@ def _reduce_rounding_imbalance(target, prices, selected_names):
 def Trade_pairs(prices):
     """Return target pair positions from rolling OLS residual mean reversion."""
     target = np.zeros(N_INST, dtype=int)
-
-    if prices.shape[1] < PAIRS_WINDOW:
+    WINDOW = PAIRS_WINDOW
+    if prices.shape[1] < WINDOW:
         return target
 
     for y_name, x_name in PAIRS:
         yi, xi = INDEX[y_name], INDEX[x_name]
-        y = prices[yi, -PAIRS_WINDOW:]
-        x = prices[xi, -PAIRS_WINDOW:]
+        y = prices[yi, -WINDOW:]
+        x = prices[xi, -WINDOW:]
 
         if (
             not np.isfinite(x).all()
