@@ -20,10 +20,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Hashable
 
-from scipy import stats
+import statsmodels.api as sm
+
 from scipy.cluster.hierarchy import dendrogram, leaves_list, linkage
 from scipy.spatial.distance import squareform
 from scipy.stats import norm
+from sklearn.decomposition import PCA
 
 from sklearn.linear_model import LassoCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -359,6 +361,7 @@ def plot_series(
 def plot_series_indicators(
     prices: DataLike,
     *,
+    instruments: Sequence[object] | None = None,
     ema_windows: Sequence[int] | None = (10, 30),
     volatility_window: int | None = 20,
     sharpe_window: int | None = 60,
@@ -367,18 +370,104 @@ def plot_series_indicators(
     n_cols: int = 4,
     title: str | None = None,
 ) -> tuple[Figure, np.ndarray]:
-    """
-    Plot each instrument and its selected indicators in a compact grid.
+    """Plot selected instruments and their indicators in a compact grid.
 
-    Pass None to exclude a feature:
-      - ema_windows=None
-      - volatility_window=None
-      - sharpe_window=None
+    Parameters
+    ----------
+    prices:
+        Price observations with rows ordered through time and one instrument
+        per column.
+    instruments:
+        Instruments to plot, specified by column name, zero-based column
+        position, or a mixture of both. The supplied order determines the plot
+        order. If ``None``, all instruments are plotted.
+    ema_windows:
+        EMA windows to display. Pass ``None`` to exclude EMAs.
+    volatility_window:
+        Rolling volatility window. Pass ``None`` to exclude volatility.
+    sharpe_window:
+        Rolling Sharpe window. Pass ``None`` to exclude Sharpe.
+    annualization:
+        Number of observations per year.
+    normalize:
+        Normalize each selected price series to 100 at its first valid value.
+    n_cols:
+        Maximum number of instruments per figure row.
+    title:
+        Optional figure title.
 
-    The returned axes array has shape:
-        (instrument_rows, n_cols, panels_per_instrument)
+    Returns
+    -------
+    tuple[Figure, numpy.ndarray]
+        The figure and an axes array shaped
+        ``(instrument_rows, columns, panels_per_instrument)``.
+
+    Raises
+    ------
+    TypeError
+        If ``instruments`` is a string instead of a sequence or contains an
+        invalid selector type.
+    ValueError
+        If no instruments are selected, selectors are duplicated, or a
+        configuration value is invalid.
+    KeyError
+        If a requested instrument name does not exist.
+    IndexError
+        If a requested instrument position is outside the available columns.
     """
     frame = _as_frame(prices, name="price")
+
+    if instruments is not None:
+        if isinstance(instruments, (str, bytes)):
+            raise TypeError(
+                "instruments must be a sequence of names or indices, "
+                "not a single string"
+            )
+
+        selectors = list(instruments)
+
+        if not selectors:
+            raise ValueError("instruments must not be empty")
+
+        selected_columns: list[object] = []
+
+        for selector in selectors:
+            if isinstance(selector, (int, np.integer)) and not isinstance(
+                selector,
+                (bool, np.bool_),
+            ):
+                position = int(selector)
+
+                if position < 0 or position >= frame.shape[1]:
+                    raise IndexError(
+                        f"instrument index {position} is outside "
+                        f"[0, {frame.shape[1] - 1}]"
+                    )
+
+                selected_columns.append(frame.columns[position])
+                continue
+
+            try:
+                exists = selector in frame.columns
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "each instrument selector must be a column name "
+                    "or zero-based integer position"
+                ) from exc
+
+            if not exists:
+                raise KeyError(
+                    f"unknown instrument name: {selector!r}"
+                )
+
+            selected_columns.append(selector)
+
+        if len(set(selected_columns)) != len(selected_columns):
+            raise ValueError(
+                "instruments must not resolve to duplicate columns"
+            )
+
+        frame = frame.loc[:, selected_columns].copy()
 
     annualization = _positive_int(
         annualization,
@@ -397,6 +486,9 @@ def plot_series_indicators(
         if ema_windows is not None
         else []
     )
+
+    if len(set(windows)) != len(windows):
+        raise ValueError("ema_windows must not contain duplicates")
 
     if volatility_window is not None:
         volatility_window = _positive_int(
@@ -421,14 +513,23 @@ def plot_series_indicators(
             )
         )
 
-        if (first == 0).any():
+        if first.isna().any():
+            missing = first.index[first.isna()].tolist()
             raise ValueError(
-                "cannot normalize a series whose first valid value is zero"
+                "cannot normalize instruments without a valid observation: "
+                f"{missing}"
+            )
+
+        if (first == 0).any():
+            zero_columns = first.index[first == 0].tolist()
+            raise ValueError(
+                "cannot normalize instruments whose first valid value is "
+                f"zero: {zero_columns}"
             )
 
         display = display.divide(first).multiply(100)
 
-    # Calculate returns only if a return-based indicator is enabled.
+    # Calculate returns only when a return-based panel is enabled.
     returns = None
 
     if volatility_window is not None or sharpe_window is not None:
@@ -511,7 +612,7 @@ def plot_series_indicators(
 
         panel_index = 0
 
-        # Price and optional EMAs
+        # Price and optional EMAs.
         price_axis = instrument_axes[panel_index]
         panel_index += 1
 
@@ -545,7 +646,7 @@ def plot_series_indicators(
         if windows:
             price_axis.legend(fontsize="x-small")
 
-        # Optional rolling volatility
+        # Optional rolling volatility.
         if volatility is not None:
             volatility_axis = instrument_axes[panel_index]
             panel_index += 1
@@ -558,10 +659,9 @@ def plot_series_indicators(
             volatility_axis.set_ylabel("Ann. volatility")
             volatility_axis.grid(alpha=0.25)
 
-        # Optional rolling Sharpe
+        # Optional rolling Sharpe.
         if sharpe is not None:
             sharpe_axis = instrument_axes[panel_index]
-            panel_index += 1
 
             sharpe_axis.plot(
                 sharpe.index,
@@ -652,6 +752,8 @@ __all__ = [
     "rolling_statistics",
     "select_instruments",
     "summary_statistics",
+    "OLSSyntheticInstrumentResult",
+    "fit_algo_synthetic_ols",
 ]
 
 def pair_instruments(
@@ -1143,779 +1245,998 @@ def find_mean_reverting_assets(
         )
     )
 
-
-def majority_return_forecast(prices, target, plot=True):
-    """
-    Predict the target's return every day using the majority of peer
-    instruments' returns from the previous day.
-
-    Rows must be ordered oldest to newest. A date index is not required.
-    """
-    if target not in prices.columns:
-        raise ValueError(f"{target!r} is not in prices.columns.")
-
-    if len(prices) < 3:
-        raise ValueError("At least three price observations are required.")
-
-    returns = prices.pct_change(fill_method=None)
-    peers = returns.drop(columns=target)
-
-    def majority_prediction(peer_returns):
-        peer_returns = peer_returns.dropna()
-
-        if peer_returns.empty:
-            return np.nan
-
-        positive = peer_returns[peer_returns > 0]
-        negative = peer_returns[peer_returns < 0]
-
-        if len(positive) > len(negative):
-            return positive.median()
-
-        if len(negative) > len(positive):
-            return negative.median()
-
-        return 0.0
-
-    # Prediction made from each day's peer returns.
-    signals = peers.apply(majority_prediction, axis=1)
-
-    # Shift forward: peers on day t predict the target on day t+1.
-    daily_predictions = signals.shift(1)
-
-    results = pd.DataFrame({
-        "prediction": daily_predictions,
-        "actual": returns[target],
-    }).dropna()
-
-    results["predicted_direction"] = np.sign(results["prediction"])
-    results["actual_direction"] = np.sign(results["actual"])
-
-    # Ignore tied votes when evaluating directional accuracy.
-    active = results["predicted_direction"] != 0
-
-    results["correct"] = np.nan
-    results.loc[active, "correct"] = (
-        results.loc[active, "predicted_direction"]
-        == results.loc[active, "actual_direction"]
-    ).astype(float)
-
-    results["strategy_return"] = (
-        results["predicted_direction"] * results["actual"]
-    )
-    results["strategy_growth"] = (
-        1 + results["strategy_return"]
-    ).cumprod()
-    results["target_growth"] = (
-        1 + results["actual"]
-    ).cumprod()
-
-    results["rolling_accuracy"] = (
-        results["correct"]
-        .rolling(20, min_periods=5)
-        .mean()
-    )
-
-    # Latest peers predict the unobserved next day.
-    tomorrow_forecast = signals.iloc[-1]
-
-    directional_accuracy = results["correct"].mean()
-
-    diagnostics = {
-        "tomorrow_forecast": tomorrow_forecast,
-        "tomorrow_direction": np.sign(tomorrow_forecast),
-        "directional_accuracy": directional_accuracy,
-        "correlation": results["prediction"].corr(results["actual"]),
-        "mae": (
-            results["prediction"] - results["actual"]
-        ).abs().mean(),
-        "number_of_predictions": len(results),
-        "results": results,
-    }
-
-    if plot:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-
-        results[["prediction", "actual"]].plot(
-            ax=axes[0, 0],
-            alpha=0.7,
-        )
-        axes[0, 0].axhline(0, color="grey", linewidth=0.8)
-        axes[0, 0].set_title("Daily predicted vs actual returns")
-        axes[0, 0].set_ylabel("Return")
-
-        results["rolling_accuracy"].plot(
-            ax=axes[0, 1],
-            color="navy",
-        )
-        axes[0, 1].axhline(
-            0.5,
-            color="grey",
-            linestyle="--",
-            label="50% reference",
-        )
-        axes[0, 1].set_ylim(0, 1)
-        axes[0, 1].set_title(
-            f"20-day directional accuracy\n"
-            f"Overall: {directional_accuracy:.2%}"
-        )
-        axes[0, 1].legend()
-
-        results[["strategy_growth", "target_growth"]].plot(
-            ax=axes[1, 0]
-        )
-        axes[1, 0].set_title("Majority strategy vs target")
-        axes[1, 0].set_ylabel("Growth of $1")
-
-        axes[1, 1].scatter(
-            results["prediction"],
-            results["actual"],
-            alpha=0.4,
-        )
-        axes[1, 1].axhline(0, color="grey", linewidth=0.8)
-        axes[1, 1].axvline(0, color="grey", linewidth=0.8)
-        axes[1, 1].set_title(
-            f"Predicted vs actual\n"
-            f"Correlation: {diagnostics['correlation']:.3f}"
-        )
-        axes[1, 1].set_xlabel("Predicted return")
-        axes[1, 1].set_ylabel("Actual return")
-
-        fig.suptitle(
-            f"{target} — tomorrow forecast: "
-            f"{tomorrow_forecast:.3%}"
-        )
-        fig.tight_layout()
-        plt.show()
-
-        diagnostics["figure"] = fig
-
-    return tomorrow_forecast, diagnostics
-
-def adaptive_majority_return_forecast(
-    prices,
-    target,
-    lookback=20,
-    min_history=None,
-    plot=True,
-):
-    """
-    Predict the target's daily return from the previous day's peer returns.
-
-    If the base majority model's trailing directional accuracy is below 50%,
-    invert the prediction. Otherwise, retain the usual prediction.
-
-    Rows must be ordered from oldest to newest.
-    """
-    if target not in prices.columns:
-        raise ValueError(f"{target!r} is not in prices.columns.")
-
-    if lookback < 1:
-        raise ValueError("lookback must be at least 1.")
-
-    if min_history is None:
-        min_history = lookback
-
-    returns = prices.pct_change(fill_method=None)
-    peers = returns.drop(columns=target)
-
-    def majority_prediction(peer_returns):
-        peer_returns = peer_returns.dropna()
-
-        if peer_returns.empty:
-            return np.nan
-
-        positive = peer_returns[peer_returns > 0]
-        negative = peer_returns[peer_returns < 0]
-
-        if len(positive) > len(negative):
-            return float(positive.median())
-
-        if len(negative) > len(positive):
-            return float(negative.median())
-
-        return 0.0
-
-    # Peer returns on row t create the base forecast for row t+1.
-    peer_signals = peers.apply(majority_prediction, axis=1)
-    base_prediction = peer_signals.shift(1)
-
-    results = pd.DataFrame({
-        "actual": returns[target],
-        "base_prediction": base_prediction,
-    }).dropna()
-
-    results["actual_direction"] = np.sign(results["actual"])
-    results["base_direction"] = np.sign(results["base_prediction"])
-
-    # Evaluate the unmodified majority model.
-    results["base_correct"] = np.where(
-        results["base_direction"] != 0,
-        (
-            results["base_direction"]
-            == results["actual_direction"]
-        ).astype(float),
-        np.nan,
-    )
-
-    # Shift by one so today's inversion decision never uses today's outcome.
-    results["prior_base_accuracy"] = (
-        results["base_correct"]
-        .rolling(
-            window=lookback,
-            min_periods=min_history,
-        )
-        .mean()
-        .shift(1)
-    )
-
-    # Use the usual prediction until enough accuracy history exists.
-    results["invert"] = (
-        results["prior_base_accuracy"].notna()
-        & (results["prior_base_accuracy"] < 0.5)
-    )
-
-    results["prediction"] = np.where(
-        results["invert"],
-        -results["base_prediction"],
-        results["base_prediction"],
-    )
-
-    results["predicted_direction"] = np.sign(results["prediction"])
-
-    results["correct"] = np.where(
-        results["predicted_direction"] != 0,
-        (
-            results["predicted_direction"]
-            == results["actual_direction"]
-        ).astype(float),
-        np.nan,
-    )
-
-    results["strategy_return"] = (
-        results["predicted_direction"] * results["actual"]
-    )
-    results["strategy_growth"] = (
-        1 + results["strategy_return"]
-    ).cumprod()
-    results["target_growth"] = (
-        1 + results["actual"]
-    ).cumprod()
-
-    results["rolling_adaptive_accuracy"] = (
-        results["correct"]
-        .rolling(lookback, min_periods=5)
-        .mean()
-    )
-
-    results["rolling_base_accuracy"] = (
-        results["base_correct"]
-        .rolling(lookback, min_periods=5)
-        .mean()
-    )
-
-    # Tomorrow's base forecast comes from the final row of peer returns.
-    tomorrow_base_forecast = peer_signals.iloc[-1]
-
-    # All currently observed outcomes can be used for tomorrow's decision.
-    tomorrow_base_accuracy = (
-        results["base_correct"]
-        .tail(lookback)
-        .mean()
-    )
-
-    enough_history = (
-        results["base_correct"]
-        .tail(lookback)
-        .count()
-        >= min_history
-    )
-
-    invert_tomorrow = (
-        enough_history
-        and tomorrow_base_accuracy < 0.5
-    )
-
-    tomorrow_forecast = (
-        -tomorrow_base_forecast
-        if invert_tomorrow
-        else tomorrow_base_forecast
-    )
-
-    diagnostics = {
-        "tomorrow_forecast": tomorrow_forecast,
-        "tomorrow_base_forecast": tomorrow_base_forecast,
-        "tomorrow_base_accuracy": tomorrow_base_accuracy,
-        "invert_tomorrow": invert_tomorrow,
-        "base_accuracy": results["base_correct"].mean(),
-        "adaptive_accuracy": results["correct"].mean(),
-        "adaptive_mae": (
-            results["prediction"] - results["actual"]
-        ).abs().mean(),
-        "number_inverted": int(results["invert"].sum()),
-        "results": results,
-    }
-
-    if plot:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-
-        results[
-            ["prediction", "actual"]
-        ].plot(ax=axes[0, 0], alpha=0.7)
-        axes[0, 0].axhline(0, color="grey", linewidth=0.8)
-        axes[0, 0].set_title("Adaptive prediction vs actual")
-
-        results[
-            ["rolling_base_accuracy", "rolling_adaptive_accuracy"]
-        ].plot(ax=axes[0, 1])
-        axes[0, 1].axhline(
-            0.5,
-            color="black",
-            linestyle="--",
-            label="Inversion threshold",
-        )
-        axes[0, 1].set_ylim(0, 1)
-        axes[0, 1].set_title(f"{lookback}-day directional accuracy")
-        axes[0, 1].legend()
-
-        results[
-            ["strategy_growth", "target_growth"]
-        ].plot(ax=axes[1, 0])
-        axes[1, 0].set_title("Adaptive strategy vs target")
-        axes[1, 0].set_ylabel("Growth of $1")
-
-        results["invert"].astype(int).plot(
-            ax=axes[1, 1],
-            color="firebrick",
-        )
-        axes[1, 1].set_yticks([0, 1])
-        axes[1, 1].set_yticklabels(["Usual", "Opposite"])
-        axes[1, 1].set_title("Prediction regime")
-
-        fig.suptitle(
-            f"{target} tomorrow forecast: {tomorrow_forecast:.3%} — "
-            f"{'INVERTED' if invert_tomorrow else 'USUAL'}"
-        )
-        fig.tight_layout()
-        plt.show()
-
-        diagnostics["figure"] = fig
-
-    return tomorrow_forecast, diagnostics
-
-Pair = tuple[Hashable, Hashable]
+PriceMode = Literal["raw", "ema"]
 
 
 @dataclass(frozen=True)
-class OLSWindowSelection:
-    """Immutable output from :func:`select_ols_window`.
+class OLSSyntheticInstrumentResult:
+    """Output from fitting an OLS synthetic instrument for one target.
 
     Attributes
     ----------
-    selected_window:
-        Longest eligible window within one standard error of the best mean
-        fold score.
-    window_summary:
-        One row per candidate window, including the cross-pair/fold score.
-    fold_results:
-        Diagnostics for every pair, window and chronological test fold.
-    daily_results:
-        Causal residuals, z-scores, positions and net strategy returns.
+    model:
+        Fitted statsmodels OLS results object.
+    diagnostics:
+        Window-level observations containing the target, prediction, residual,
+        residual z-score, and target's next-day return.
+    coefficients:
+        Fitted intercept and predictor coefficients.
+    figure:
+        Four-panel diagnostic figure.
+    axes:
+        Two-by-two array of diagnostic axes.
+    target:
+        Name of the modelled instrument.
+    predictors:
+        Predictor instrument names in model order.
+    price_mode:
+        Whether the regression used raw or EMA-smoothed prices.
+    window:
+        Number of most recent observations used to fit the model.
+    ema_span:
+        EMA span when ``price_mode="ema"``; otherwise ``None``.
     """
 
-    selected_window: int
-    window_summary: pd.DataFrame
-    fold_results: pd.DataFrame
-    daily_results: pd.DataFrame
+    model: object
+    diagnostics: pd.DataFrame
+    coefficients: pd.Series
+    figure: Figure
+    axes: np.ndarray
+    target: object
+    predictors: tuple[object, ...]
+    price_mode: PriceMode
+    window: int
+    ema_span: int | None
 
 
-def _validate_inputs(
+def fit_algo_synthetic_ols(
     prices: pd.DataFrame,
-    pairs: Sequence[Pair],
-    windows: Sequence[int],
+    instruments: Sequence[object],
     *,
-    zscore_window: int,
-    fold_size: int,
-    annualization: int,
-    entry_z: float,
-    exit_z: float,
-    transaction_cost_bps: float,
-    minimum_trades: int,
-) -> tuple[pd.DataFrame, tuple[Pair, ...], tuple[int, ...]]:
-    """Validate and normalize public inputs."""
+    target: object = "ALGO",
+    window: int = 250,
+    price_mode: PriceMode = "raw",
+    ema_span: int = 20,
+    include_intercept: bool = True,
+    distribution_bins: int = 30,
+    confidence_level: float = 0.95,
+    figure_size: tuple[float, float] = (14.0, 10.0),
+) -> OLSSyntheticInstrumentResult:
+    """Fit a rolling-window OLS synthetic instrument and plot diagnostics.
+
+    The target instrument is regressed on the supplied predictor instruments:
+
+        target_price[t] = intercept + X[t] @ beta + residual[t]
+
+    Only the latest ``window`` observations are used. ``price_mode="raw"``
+    regresses raw price levels. ``price_mode="ema"`` first applies an
+    exponentially weighted moving average to every selected price series.
+
+    The next-day target return in the diagnostic table is always calculated
+    from the original, unsmoothed target prices:
+
+        next_day_return[t] = price[t + 1] / price[t] - 1
+
+    Consequently, the final residual has no known next-day return and is
+    excluded only from the residual-versus-forward-return scatter plot.
+
+    Parameters
+    ----------
+    prices:
+        Price DataFrame with days as rows and instruments as columns. Rows must
+        be chronologically ordered.
+    instruments:
+        Predictor instruments. Do not include ``target``.
+    target:
+        Target instrument, normally ``"ALGO"``.
+    window:
+        Number of most recent complete observations used for OLS.
+    price_mode:
+        ``"raw"`` or ``"ema"``.
+    ema_span:
+        EMA span used when ``price_mode="ema"``.
+    include_intercept:
+        Include an OLS intercept when true.
+    distribution_bins:
+        Histogram bin count for the residual distribution.
+    confidence_level:
+        Confidence level used for the residual reference band in the
+        residual-time plot.
+    figure_size:
+        Matplotlib figure size.
+
+    Returns
+    -------
+    OLSSyntheticInstrumentResult
+        Structured result containing the model and all diagnostics.
+
+    Raises
+    ------
+    TypeError
+        If ``prices`` is not a DataFrame or contains non-numeric data.
+    ValueError
+        If configuration or observations are invalid.
+    KeyError
+        If a requested instrument is missing.
+    """
     if not isinstance(prices, pd.DataFrame):
         raise TypeError("prices must be a pandas DataFrame")
-    if prices.empty or prices.shape[1] < 2:
-        raise ValueError("prices must contain observations for at least two instruments")
-    if not prices.index.is_monotonic_increasing or not prices.index.is_unique:
-        raise ValueError("prices index must be unique and ordered chronologically")
+
+    if prices.empty:
+        raise ValueError("prices must not be empty")
+
     if not prices.columns.is_unique:
-        raise ValueError("prices columns must be unique")
+        raise ValueError("price columns must be unique")
 
-    try:
-        clean_prices = prices.astype(float).copy()
-    except (TypeError, ValueError) as exc:
-        raise TypeError("prices must contain numeric values") from exc
-    values = clean_prices.to_numpy()
-    if np.isinf(values).any():
-        raise ValueError("prices must not contain infinite values")
-    if (clean_prices <= 0).any().any():
-        raise ValueError("log-price OLS requires strictly positive prices")
+    if not prices.index.is_monotonic_increasing:
+        raise ValueError(
+            "prices must be ordered chronologically by an increasing index"
+        )
 
-    normalized_pairs = tuple(tuple(pair) for pair in pairs)
-    if not normalized_pairs:
-        raise ValueError("pairs must not be empty")
-    if any(len(pair) != 2 or pair[0] == pair[1] for pair in normalized_pairs):
-        raise ValueError("each pair must contain two different instruments")
-    missing = {
+    if isinstance(instruments, (str, bytes)):
+        raise TypeError(
+            "instruments must be a sequence of instrument names, not a string"
+        )
+
+    predictors = tuple(instruments)
+
+    if not predictors:
+        raise ValueError("instruments must contain at least one predictor")
+
+    if len(set(predictors)) != len(predictors):
+        raise ValueError("instruments must not contain duplicates")
+
+    if target in predictors:
+        raise ValueError(
+            f"target {target!r} must not also appear in instruments"
+        )
+
+    requested = (target, *predictors)
+    missing = [
         instrument
-        for pair in normalized_pairs
-        for instrument in pair
-        if instrument not in clean_prices.columns
-    }
-    if missing:
-        raise KeyError(f"unknown instruments: {sorted(missing, key=str)}")
-    if len(set(normalized_pairs)) != len(normalized_pairs):
-        raise ValueError("pairs must not contain duplicates")
-
-    normalized_windows: list[int] = []
-    for window in windows:
-        if isinstance(window, bool) or not isinstance(window, (int, np.integer)):
-            raise TypeError("windows must contain integers")
-        if int(window) < 3:
-            raise ValueError("each OLS window must be at least 3")
-        normalized_windows.append(int(window))
-    if not normalized_windows:
-        raise ValueError("windows must not be empty")
-    normalized_windows = sorted(set(normalized_windows))
-
-    integer_parameters = {
-        "zscore_window": zscore_window,
-        "fold_size": fold_size,
-        "annualization": annualization,
-        "minimum_trades": minimum_trades,
-    }
-    for name, value in integer_parameters.items():
-        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-            raise TypeError(f"{name} must be an integer")
-        if int(value) <= 0:
-            raise ValueError(f"{name} must be positive")
-    if zscore_window < 2:
-        raise ValueError("zscore_window must be at least 2")
-    if not np.isfinite(entry_z) or entry_z <= 0:
-        raise ValueError("entry_z must be positive and finite")
-    if not np.isfinite(exit_z) or exit_z < 0 or exit_z >= entry_z:
-        raise ValueError("exit_z must satisfy 0 <= exit_z < entry_z")
-    if not np.isfinite(transaction_cost_bps) or transaction_cost_bps < 0:
-        raise ValueError("transaction_cost_bps must be non-negative and finite")
-
-    required = max(normalized_windows) + zscore_window + fold_size + 1
-    if len(clean_prices) < required:
-        raise ValueError(
-            f"prices has {len(clean_prices)} rows; at least {required} are required "
-            "for the largest window, z-score history and one test fold"
-        )
-    return clean_prices, normalized_pairs, tuple(normalized_windows)
-
-
-def _causal_rolling_ols(
-    y: pd.Series,
-    x: pd.Series,
-    window: int,
-) -> pd.DataFrame:
-    """Return one-step-ahead rolling OLS parameters and residuals."""
-    # Shift first: the estimate at t uses [t-window, ..., t-1].
-    y_lagged = y.shift(1)
-    x_lagged = x.shift(1)
-    x_roll = x_lagged.rolling(window, min_periods=window)
-    y_roll = y_lagged.rolling(window, min_periods=window)
-    variance = x_roll.var(ddof=1)
-    beta = y_roll.cov(x_lagged) / variance
-    beta = beta.where(variance > np.finfo(float).eps)
-    alpha = y_roll.mean() - beta * x_roll.mean()
-    residual = y - alpha - beta * x
-    return pd.DataFrame({"alpha": alpha, "beta": beta, "residual": residual})
-
-
-def _causal_zscore(residual: pd.Series, window: int) -> pd.Series:
-    """Standardize residuals using only prior residual observations."""
-    history = residual.shift(1).rolling(window, min_periods=window)
-    mean = history.mean()
-    standard_deviation = history.std(ddof=1)
-    return ((residual - mean) / standard_deviation).where(
-        standard_deviation > np.finfo(float).eps
-    )
-
-
-def _positions_from_zscore(
-    zscore: pd.Series,
-    *,
-    entry_z: float,
-    exit_z: float,
-) -> pd.Series:
-    """Create a deterministic, close-to-close mean-reversion position."""
-    positions = np.zeros(len(zscore), dtype=float)
-    current = 0.0
-    for location, value in enumerate(zscore.to_numpy(dtype=float)):
-        if not np.isfinite(value):
-            current = 0.0
-        elif current == 0.0:
-            if value >= entry_z:
-                current = -1.0
-            elif value <= -entry_z:
-                current = 1.0
-        elif abs(value) <= exit_z or np.sign(value) == current:
-            current = 0.0
-        positions[location] = current
-    return pd.Series(positions, index=zscore.index, name="position")
-
-
-def _daily_pair_results(
-    log_prices: pd.DataFrame,
-    pair: Pair,
-    window: int,
-    *,
-    zscore_window: int,
-    entry_z: float,
-    exit_z: float,
-    transaction_cost_bps: float,
-) -> pd.DataFrame:
-    """Backtest one pair/window with lagged signals and normalized exposure."""
-    dependent, independent = pair
-    y = log_prices[dependent]
-    x = log_prices[independent]
-    model = _causal_rolling_ols(y, x, window)
-    zscore = _causal_zscore(model["residual"], zscore_window)
-    desired_position = _positions_from_zscore(
-        zscore, entry_z=entry_z, exit_z=exit_z
-    )
-
-    # A signal observed at close t earns the close-to-close return t -> t+1.
-    held_position = desired_position.shift(1).fillna(0.0)
-    held_beta = model["beta"].shift(1)
-    y_return = y.diff()
-    x_return = x.diff()
-    gross_return = (
-        held_position
-        * (y_return - held_beta * x_return)
-        / (1.0 + held_beta.abs())
-    )
-
-    turnover = desired_position.diff().abs().fillna(desired_position.abs())
-    costs = turnover.shift(1).fillna(0.0) * transaction_cost_bps / 10_000.0
-    net_return = gross_return - costs
-    trade_entry = (
-        desired_position.ne(0.0)
-        & desired_position.shift(1, fill_value=0.0).eq(0.0)
-    )
-
-    return model.assign(
-        zscore=zscore,
-        desired_position=desired_position,
-        held_position=held_position,
-        gross_return=gross_return,
-        turnover=turnover,
-        cost=costs,
-        net_return=net_return,
-        trade_entry=trade_entry.astype(int),
-    )
-
-
-def _fold_statistics(
-    daily: pd.DataFrame,
-    *,
-    fold_size: int,
-    annualization: int,
-    minimum_trades: int,
-) -> list[dict[str, float | int | bool]]:
-    """Calculate non-overlapping chronological fold statistics."""
-    valid = daily.dropna(subset=["net_return", "residual", "beta"])
-    if valid.empty:
-        return []
-
-    records: list[dict[str, float | int | bool]] = []
-    for fold_number, start in enumerate(range(0, len(valid), fold_size)):
-        fold = valid.iloc[start : start + fold_size]
-        if len(fold) < fold_size:
-            break
-
-        returns = fold["net_return"]
-        volatility = float(returns.std(ddof=1))
-        sharpe = (
-            float(np.sqrt(annualization) * returns.mean() / volatility)
-            if volatility > np.finfo(float).eps
-            else np.nan
-        )
-        wealth = (1.0 + returns).cumprod()
-        drawdown = wealth / wealth.cummax() - 1.0
-        trades = int(fold["trade_entry"].sum())
-        beta_mean = float(fold["beta"].abs().mean())
-        beta_instability = float(fold["beta"].diff().abs().mean())
-        beta_instability /= max(beta_mean, np.finfo(float).eps)
-        crossings = int(
-            np.sign(fold["residual"])
-            .diff()
-            .abs()
-            .fillna(0.0)
-            .gt(0.0)
-            .sum()
-        )
-        eligible = trades >= minimum_trades and np.isfinite(sharpe)
-        records.append(
-            {
-                "fold": fold_number,
-                "start": fold.index[0],
-                "end": fold.index[-1],
-                "observations": len(fold),
-                "trades": trades,
-                "crossings": crossings,
-                "net_return": float(wealth.iloc[-1] - 1.0),
-                "sharpe": sharpe,
-                "maximum_drawdown": float(drawdown.min()),
-                "turnover": float(fold["turnover"].sum()),
-                "beta_instability": beta_instability,
-                "eligible": eligible,
-            }
-        )
-    return records
-
-
-def select_ols_window(
-    prices: pd.DataFrame,
-    pairs: Sequence[Pair],
-    *,
-    windows: Sequence[int] = (20, 40, 60, 80, 120, 250),
-    zscore_window: int = 20,
-    fold_size: int = 63,
-    annualization: int = 252,
-    entry_z: float = 2.0,
-    exit_z: float = 0.5,
-    transaction_cost_bps: float = 5.0,
-    minimum_trades: int = 2,
-) -> OLSWindowSelection:
-    """Select a global rolling-OLS window with chronological validation.
-
-    Prices are converted to logs internally.  Each candidate is evaluated with
-    the same causal mean-reversion strategy.  Fold score is net Sharpe; only
-    folds meeting ``minimum_trades`` are eligible.  Window-level results pool
-    eligible pair/fold observations.
-
-    Selection uses the one-standard-error rule: among candidates whose mean
-    score is no more than one standard error below the highest mean score,
-    choose the longest window.  This favors hedge-ratio stability when observed
-    performance is statistically indistinguishable.
-    """
-    clean_prices, normalized_pairs, normalized_windows = _validate_inputs(
-        prices,
-        pairs,
-        windows,
-        zscore_window=zscore_window,
-        fold_size=fold_size,
-        annualization=annualization,
-        entry_z=entry_z,
-        exit_z=exit_z,
-        transaction_cost_bps=transaction_cost_bps,
-        minimum_trades=minimum_trades,
-    )
-    log_prices = np.log(clean_prices)
-    # Compare every candidate over exactly the same calendar observations.
-    # Short windows must not receive extra, earlier folds unavailable to long
-    # windows, as that would confound window length with market regime.
-    common_evaluation_start = max(normalized_windows) + zscore_window
-
-    daily_frames: list[pd.DataFrame] = []
-    fold_records: list[dict[str, object]] = []
-    for dependent, independent in normalized_pairs:
-        for window in normalized_windows:
-            daily = _daily_pair_results(
-                log_prices,
-                (dependent, independent),
-                window,
-                zscore_window=zscore_window,
-                entry_z=entry_z,
-                exit_z=exit_z,
-                transaction_cost_bps=transaction_cost_bps,
-            )
-            daily.insert(0, "window", window)
-            daily.insert(0, "independent", independent)
-            daily.insert(0, "dependent", dependent)
-            daily_frames.append(daily)
-
-            for record in _fold_statistics(
-                daily.iloc[common_evaluation_start:],
-                fold_size=fold_size,
-                annualization=annualization,
-                minimum_trades=minimum_trades,
-            ):
-                fold_records.append(
-                    {
-                        "dependent": dependent,
-                        "independent": independent,
-                        "window": window,
-                        **record,
-                    }
-                )
-
-    if not fold_records:
-        raise ValueError("no complete validation folds could be constructed")
-
-    fold_results = pd.DataFrame.from_records(fold_records)
-    eligible = fold_results.loc[fold_results["eligible"]].copy()
-    if eligible.empty:
-        raise ValueError(
-            "no fold met minimum_trades; reduce minimum_trades, entry_z, or fold_size"
-        )
-
-    grouped = eligible.groupby("window", sort=True)
-    summary = grouped.agg(
-        eligible_folds=("sharpe", "size"),
-        mean_fold_sharpe=("sharpe", "mean"),
-        median_fold_sharpe=("sharpe", "median"),
-        fold_sharpe_std=("sharpe", "std"),
-        worst_fold_sharpe=("sharpe", "min"),
-        mean_maximum_drawdown=("maximum_drawdown", "mean"),
-        total_trades=("trades", "sum"),
-        mean_turnover=("turnover", "mean"),
-        mean_beta_instability=("beta_instability", "mean"),
-    )
-    summary = summary.reindex(normalized_windows)
-    summary["standard_error"] = (
-        summary["fold_sharpe_std"]
-        .fillna(0.0)
-        / np.sqrt(summary["eligible_folds"])
-    )
-    summary["eligible"] = summary["eligible_folds"].fillna(0).gt(0)
-
-    available = summary.loc[summary["eligible"]]
-    best_window = int(available["mean_fold_sharpe"].idxmax())
-    cutoff = float(
-        available.loc[best_window, "mean_fold_sharpe"]
-        - available.loc[best_window, "standard_error"]
-    )
-    summary["within_one_standard_error"] = (
-        summary["eligible"] & summary["mean_fold_sharpe"].ge(cutoff)
-    )
-    selected_window = int(
-        summary.index[summary["within_one_standard_error"]].max()
-    )
-    summary["selected"] = summary.index == selected_window
-    summary.index.name = "window"
-
-    daily_results = pd.concat(daily_frames, axis=0)
-    daily_results = daily_results.set_index(
-        ["dependent", "independent", "window"], append=True
-    ).reorder_levels(["dependent", "independent", "window", daily_results.index.name])
-    daily_results.index.names = [
-        "dependent",
-        "independent",
-        "window",
-        "observation",
+        for instrument in requested
+        if instrument not in prices.columns
     ]
 
-    return OLSWindowSelection(
-        selected_window=selected_window,
-        window_summary=summary,
-        fold_results=fold_results,
-        daily_results=daily_results.sort_index(),
+    if missing:
+        raise KeyError(f"unknown instrument(s): {missing}")
+
+    if (
+        isinstance(window, bool)
+        or not isinstance(window, (int, np.integer))
+        or window <= 0
+    ):
+        raise ValueError("window must be a positive integer")
+
+    window = int(window)
+
+    if price_mode not in {"raw", "ema"}:
+        raise ValueError("price_mode must be 'raw' or 'ema'")
+
+    if (
+        isinstance(ema_span, bool)
+        or not isinstance(ema_span, (int, np.integer))
+        or ema_span <= 0
+    ):
+        raise ValueError("ema_span must be a positive integer")
+
+    ema_span = int(ema_span)
+
+    if (
+        isinstance(distribution_bins, bool)
+        or not isinstance(distribution_bins, (int, np.integer))
+        or distribution_bins < 5
+    ):
+        raise ValueError("distribution_bins must be an integer of at least 5")
+
+    distribution_bins = int(distribution_bins)
+
+    if not 0.0 < float(confidence_level) < 1.0:
+        raise ValueError("confidence_level must lie strictly between 0 and 1")
+
+    if len(figure_size) != 2 or any(
+        not np.isfinite(value) or value <= 0
+        for value in figure_size
+    ):
+        raise ValueError(
+            "figure_size must contain two positive finite values"
+        )
+
+    try:
+        selected_prices = prices.loc[:, list(requested)].astype(float)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "selected price columns must contain only numeric values"
+        ) from exc
+
+    selected_values = selected_prices.to_numpy(dtype=float)
+
+    if not np.isfinite(selected_values).all():
+        raise ValueError(
+            "selected price observations must all be finite"
+        )
+
+    if (selected_values <= 0).any():
+        raise ValueError(
+            "selected prices must be strictly positive"
+        )
+
+    number_of_parameters = len(predictors) + int(include_intercept)
+    minimum_observations = number_of_parameters + 2
+
+    if window < minimum_observations:
+        raise ValueError(
+            f"window={window} is too small for {number_of_parameters} "
+            f"model parameters; use at least {minimum_observations} observations"
+        )
+
+    if len(selected_prices) < window:
+        raise ValueError(
+            f"window={window} requires at least {window} price rows; "
+            f"received {len(selected_prices)}"
+        )
+
+    if price_mode == "ema":
+        modelling_prices = selected_prices.ewm(
+            span=ema_span,
+            adjust=False,
+            min_periods=1,
+        ).mean()
+    else:
+        modelling_prices = selected_prices.copy()
+
+    modelling_window = modelling_prices.iloc[-window:].copy()
+
+    y = modelling_window[target].rename(str(target))
+    X = modelling_window.loc[:, list(predictors)].copy()
+
+    if include_intercept:
+        X_design = sm.add_constant(
+            X,
+            has_constant="add",
+        )
+    else:
+        X_design = X
+
+    matrix = X_design.to_numpy(dtype=float)
+    matrix_rank = int(np.linalg.matrix_rank(matrix))
+
+    if matrix_rank < matrix.shape[1]:
+        raise ValueError(
+            "OLS design matrix is rank deficient. The predictor instruments "
+            "are perfectly or nearly perfectly collinear; remove predictors "
+            "or use ridge regression/PCA."
+        )
+
+    model = sm.OLS(
+        endog=y,
+        exog=X_design,
+        missing="raise",
+    ).fit()
+
+    predicted = pd.Series(
+        model.fittedvalues,
+        index=modelling_window.index,
+        name="predicted",
+        dtype=float,
     )
+    residual = pd.Series(
+        model.resid,
+        index=modelling_window.index,
+        name="residual",
+        dtype=float,
+    )
+
+    residual_mean = float(residual.mean())
+    residual_std = float(residual.std(ddof=0))
+
+    if not np.isfinite(residual_mean):
+        raise ValueError("fitted residual mean is not finite")
+
+    if (
+        not np.isfinite(residual_std)
+        or residual_std <= np.finfo(float).eps
+    ):
+        raise ValueError(
+            "fitted residuals have zero or numerically negligible variation"
+        )
+
+    residual_zscore = (
+        (residual - residual_mean) / residual_std
+    ).rename("residual_zscore")
+
+    # Calculate forward returns from original, unsmoothed ALGO prices.
+    all_target_returns = (
+        selected_prices[target]
+        .pct_change(fill_method=None)
+        .shift(-1)
+        .rename("next_day_target_return")
+    )
+
+    diagnostics = pd.DataFrame(
+        {
+            "target": y,
+            "predicted": predicted,
+            "residual": residual,
+            "residual_zscore": residual_zscore,
+            "next_day_target_return": all_target_returns.reindex(
+                modelling_window.index
+            ),
+        },
+        index=modelling_window.index,
+    )
+    diagnostics.index.name = prices.index.name or "observation"
+
+    if not np.isfinite(
+        diagnostics[
+            ["target", "predicted", "residual", "residual_zscore"]
+        ].to_numpy(dtype=float)
+    ).all():
+        raise ValueError(
+            "model produced non-finite diagnostic values"
+        )
+
+    coefficients = pd.Series(
+        model.params,
+        index=X_design.columns,
+        name="coefficient",
+        dtype=float,
+    )
+
+    figure, axes = plt.subplots(
+        2,
+        2,
+        figsize=figure_size,
+        squeeze=False,
+    )
+
+    confidence_multiplier = float(
+        norm.ppf((1.0 + float(confidence_level)) / 2.0)
+    )
+
+    # Panel 1: residual through time.
+    time_axis: Axes = axes[0, 0]
+    time_axis.plot(
+        residual.index,
+        residual,
+        color="tab:blue",
+        linewidth=1.3,
+        label="OLS residual",
+    )
+    time_axis.axhline(
+        residual_mean,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+        label=f"Mean = {residual_mean:.4g}",
+    )
+    time_axis.axhline(
+        residual_mean + confidence_multiplier * residual_std,
+        color="tab:red",
+        linestyle=":",
+        linewidth=1.0,
+        label=(
+            f"{confidence_level:.0%} normal reference band"
+        ),
+    )
+    time_axis.axhline(
+        residual_mean - confidence_multiplier * residual_std,
+        color="tab:red",
+        linestyle=":",
+        linewidth=1.0,
+    )
+    time_axis.scatter(
+        [residual.index[-1]],
+        [residual.iloc[-1]],
+        color="tab:orange",
+        s=45,
+        zorder=3,
+        label=f"Latest z = {residual_zscore.iloc[-1]:.2f}",
+    )
+    time_axis.set_title("OLS residual through time")
+    time_axis.set_xlabel("Observation")
+    time_axis.set_ylabel("Residual")
+    time_axis.grid(alpha=0.25)
+    time_axis.legend(fontsize="small")
+
+    # Panel 2: residual versus predicted target price.
+    fitted_axis: Axes = axes[0, 1]
+    fitted_axis.scatter(
+        predicted,
+        residual,
+        alpha=0.7,
+        edgecolors="none",
+    )
+    fitted_axis.axhline(
+        residual_mean,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+    )
+
+    fitted_correlation = float(
+        predicted.corr(residual)
+    )
+
+    fitted_axis.set_title(
+        "Residual vs predicted target price\n"
+        f"Correlation = {fitted_correlation:.3f}"
+    )
+    fitted_axis.set_xlabel(f"Predicted {target} price")
+    fitted_axis.set_ylabel("Residual")
+    fitted_axis.grid(alpha=0.25)
+
+    # Panel 3: residual distribution and fitted normal density.
+    distribution_axis: Axes = axes[1, 0]
+    distribution_axis.hist(
+        residual,
+        bins=distribution_bins,
+        density=True,
+        alpha=0.65,
+        color="tab:blue",
+        edgecolor="white",
+        label="Residuals",
+    )
+
+    x_min = float(residual.min())
+    x_max = float(residual.max())
+
+    if np.isclose(x_min, x_max):
+        x_min = residual_mean - 4.0 * residual_std
+        x_max = residual_mean + 4.0 * residual_std
+
+    density_x = np.linspace(
+        x_min,
+        x_max,
+        400,
+    )
+    density_y = norm.pdf(
+        density_x,
+        loc=residual_mean,
+        scale=residual_std,
+    )
+
+    distribution_axis.plot(
+        density_x,
+        density_y,
+        color="tab:red",
+        linewidth=2.0,
+        label="Fitted normal density",
+    )
+    distribution_axis.axvline(
+        residual.iloc[-1],
+        color="tab:orange",
+        linestyle="--",
+        linewidth=1.2,
+        label="Latest residual",
+    )
+    distribution_axis.set_title(
+        "Residual distribution and normal fit"
+    )
+    distribution_axis.set_xlabel("Residual")
+    distribution_axis.set_ylabel("Density")
+    distribution_axis.grid(alpha=0.25)
+    distribution_axis.legend(fontsize="small")
+
+    # Panel 4: residual versus the following day's ALGO return.
+    forward_axis: Axes = axes[1, 1]
+    forward_data = diagnostics.dropna(
+        subset=["residual", "next_day_target_return"]
+    )
+
+    if len(forward_data) >= 2:
+        forward_axis.scatter(
+            forward_data["residual"],
+            forward_data["next_day_target_return"],
+            alpha=0.7,
+            edgecolors="none",
+        )
+
+        regression_x = forward_data["residual"].to_numpy(
+            dtype=float
+        )
+        regression_y = forward_data[
+            "next_day_target_return"
+        ].to_numpy(dtype=float)
+
+        slope, intercept = np.polyfit(
+            regression_x,
+            regression_y,
+            deg=1,
+        )
+
+        line_x = np.linspace(
+            regression_x.min(),
+            regression_x.max(),
+            200,
+        )
+        forward_axis.plot(
+            line_x,
+            intercept + slope * line_x,
+            color="tab:red",
+            linewidth=1.5,
+            label=f"Linear slope = {slope:.4g}",
+        )
+
+        forward_correlation = float(
+            forward_data["residual"].corr(
+                forward_data["next_day_target_return"]
+            )
+        )
+        forward_axis.set_title(
+            f"Residual vs next-day {target} return\n"
+            f"Correlation = {forward_correlation:.3f}"
+        )
+        forward_axis.legend(fontsize="small")
+    else:
+        forward_axis.text(
+            0.5,
+            0.5,
+            "Insufficient forward-return observations",
+            ha="center",
+            va="center",
+            transform=forward_axis.transAxes,
+        )
+        forward_axis.set_title(
+            f"Residual vs next-day {target} return"
+        )
+
+    forward_axis.axhline(
+        0.0,
+        color="black",
+        linestyle="--",
+        linewidth=0.8,
+    )
+    forward_axis.axvline(
+        residual_mean,
+        color="black",
+        linestyle=":",
+        linewidth=0.8,
+    )
+    forward_axis.set_xlabel("Current residual")
+    forward_axis.set_ylabel(f"Next-day {target} return")
+    forward_axis.grid(alpha=0.25)
+
+    mode_description = (
+        f"EMA(span={ema_span})"
+        if price_mode == "ema"
+        else "raw prices"
+    )
+
+    figure.suptitle(
+        f"{target} synthetic-instrument OLS diagnostics\n"
+        f"{len(predictors)} predictors · {window}-day window · "
+        f"{mode_description} · adjusted R² = {model.rsquared_adj:.4f}",
+        fontsize=14,
+    )
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+
+    return OLSSyntheticInstrumentResult(
+        model=model,
+        diagnostics=diagnostics,
+        coefficients=coefficients,
+        figure=figure,
+        axes=axes,
+        target=target,
+        predictors=predictors,
+        price_mode=price_mode,
+        window=window,
+        ema_span=ema_span if price_mode == "ema" else None,
+    )
+
+def _prepare_multi_ols_data(
+    prices: DataLike,
+    instruments: Sequence[object],
+) -> pd.DataFrame:
+    """Validate and select data used by multi-instrument OLS functions."""
+    frame = _as_frame(prices, name="price")
+
+    if isinstance(instruments, (str, bytes)):
+        raise TypeError("instruments must be a sequence, not a string")
+
+    instruments = tuple(instruments)
+
+    if len(instruments) < 2:
+        raise ValueError("at least two instruments are required")
+
+    if len(set(instruments)) != len(instruments):
+        raise ValueError("instruments must not contain duplicates")
+
+    selected = select_instruments(frame, instruments)
+
+    values = selected.to_numpy(dtype=float)
+
+    if np.isinf(values).any():
+        raise ValueError("prices must not contain infinite values")
+
+    return selected
+
+def plot_multi_ols_fits(
+    prices: DataLike,
+    instruments: Sequence[object],
+    *,
+    window: int = 250,
+    columns: int = 3,
+    include_intercept: bool = True,
+) -> tuple[
+    dict[object, object],
+    pd.DataFrame,
+    Figure,
+    np.ndarray,
+]:
+    """
+    Fit each instrument against all other instruments and plot actual
+    versus fitted target prices.
+
+    Returns
+    -------
+    models:
+        Mapping from target name to fitted statsmodels OLS result.
+    fitted_data:
+        DataFrame with MultiIndex columns:
+            (target, "actual")
+            (target, "fitted")
+            (target, "residual")
+    figure, axes:
+        Matplotlib plotting objects.
+    """
+    frame = _prepare_multi_ols_data(
+        prices,
+        instruments,
+    )
+
+    window = _positive_int(window, name="window")
+    columns = _positive_int(columns, name="columns")
+
+    # Use the most recent complete observations.
+    sample = frame.dropna(how="any").iloc[-window:]
+
+    if len(sample) < window:
+        raise ValueError(
+            f"window={window} requires at least {window} "
+            "complete observations"
+        )
+
+    number_of_predictors = sample.shape[1] - 1
+    number_of_parameters = (
+        number_of_predictors + int(include_intercept)
+    )
+
+    if len(sample) <= number_of_parameters:
+        raise ValueError(
+            "window is too small for the number of OLS parameters"
+        )
+
+    columns = min(columns, sample.shape[1])
+    rows = int(np.ceil(sample.shape[1] / columns))
+
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(5 * columns, 3.5 * rows),
+        squeeze=False,
+        sharex=True,
+    )
+
+    models: dict[object, object] = {}
+    results: dict[object, pd.DataFrame] = {}
+
+    for axis, target_name in zip(
+        axes.flat,
+        sample.columns,
+    ):
+        predictor_names = [
+            name
+            for name in sample.columns
+            if name != target_name
+        ]
+
+        y = sample[target_name]
+        X = sample.loc[:, predictor_names]
+
+        if include_intercept:
+            X_design = sm.add_constant(
+                X,
+                has_constant="add",
+            )
+        else:
+            X_design = X
+
+        matrix = X_design.to_numpy(dtype=float)
+
+        if np.linalg.matrix_rank(matrix) < matrix.shape[1]:
+            axis.text(
+                0.5,
+                0.5,
+                "Rank-deficient OLS",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+            axis.set_title(str(target_name))
+            axis.grid(alpha=0.25)
+            continue
+
+        model = sm.OLS(
+            y,
+            X_design,
+            missing="raise",
+        ).fit()
+
+        fitted = pd.Series(
+            model.fittedvalues,
+            index=sample.index,
+            name="fitted",
+        )
+        residual = (
+            y - fitted
+        ).rename("residual")
+
+        models[target_name] = model
+        results[target_name] = pd.DataFrame(
+            {
+                "actual": y,
+                "fitted": fitted,
+                "residual": residual,
+            }
+        )
+
+        axis.plot(
+            y.index,
+            y,
+            linewidth=1.3,
+            label="Actual",
+        )
+        axis.plot(
+            fitted.index,
+            fitted,
+            linewidth=1.2,
+            linestyle="--",
+            label="OLS fitted",
+        )
+
+        axis.set_title(
+            f"{target_name}\n"
+            f"Adjusted R² = {model.rsquared_adj:.3f}"
+        )
+        axis.set_xlabel("Observation")
+        axis.set_ylabel("Price")
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize="small")
+
+    for axis in axes.flat[sample.shape[1]:]:
+        axis.set_visible(False)
+
+    if not results:
+        raise ValueError(
+            "all OLS models were rank deficient"
+        )
+
+    fitted_data = pd.concat(
+        results,
+        axis=1,
+    )
+    fitted_data.columns.names = [
+        "target",
+        "series",
+    ]
+
+    figure.suptitle(
+        "Multi-Instrument OLS: Actual vs Fitted",
+        y=1.01,
+    )
+    figure.tight_layout()
+
+    return models, fitted_data, figure, axes
+
+
+def plot_rolling_multi_ols_spreads(
+    prices: DataLike,
+    instruments: Sequence[object],
+    *,
+    rolling_window: int = 250,
+    columns: int = 3,
+    include_intercept: bool = True,
+) -> tuple[pd.DataFrame, Figure, np.ndarray]:
+    """
+    Plot one-step-ahead rolling OLS residuals for every target instrument.
+
+    For each target and observation t:
+
+        model_t = OLS fitted on [t - rolling_window, t)
+        residual_t = actual_target[t] - prediction_t
+
+    Thus, the current observation is never included in its own OLS fit.
+    """
+    frame = _prepare_multi_ols_data(
+        prices,
+        instruments,
+    )
+
+    rolling_window = _positive_int(
+        rolling_window,
+        name="rolling_window",
+    )
+    columns = _positive_int(
+        columns,
+        name="columns",
+    )
+
+    number_of_predictors = frame.shape[1] - 1
+    number_of_parameters = (
+        number_of_predictors + int(include_intercept)
+    )
+
+    if rolling_window <= number_of_parameters:
+        raise ValueError(
+            f"rolling_window={rolling_window} is too small for "
+            f"{number_of_parameters} OLS parameters"
+        )
+
+    if len(frame) <= rolling_window:
+        raise ValueError(
+            "prices must contain more observations than rolling_window"
+        )
+
+    residuals = pd.DataFrame(
+        np.nan,
+        index=frame.index,
+        columns=frame.columns,
+        dtype=float,
+    )
+
+    for target_name in frame.columns:
+        predictor_names = [
+            name
+            for name in frame.columns
+            if name != target_name
+        ]
+
+        y_all = frame[target_name].to_numpy(dtype=float)
+        X_all = frame.loc[
+            :,
+            predictor_names,
+        ].to_numpy(dtype=float)
+
+        for current_location in range(
+            rolling_window,
+            len(frame),
+        ):
+            start = current_location - rolling_window
+
+            y_train = y_all[
+                start:current_location
+            ]
+            X_train = X_all[
+                start:current_location
+            ]
+            y_current = y_all[current_location]
+            X_current = X_all[current_location]
+
+            if (
+                not np.isfinite(y_train).all()
+                or not np.isfinite(X_train).all()
+                or not np.isfinite(y_current)
+                or not np.isfinite(X_current).all()
+            ):
+                continue
+
+            if include_intercept:
+                design_train = np.column_stack(
+                    [
+                        np.ones(rolling_window),
+                        X_train,
+                    ]
+                )
+                design_current = np.concatenate(
+                    ([1.0], X_current)
+                )
+            else:
+                design_train = X_train
+                design_current = X_current
+
+            if (
+                np.linalg.matrix_rank(design_train)
+                < design_train.shape[1]
+            ):
+                continue
+
+            coefficients, _, _, _ = np.linalg.lstsq(
+                design_train,
+                y_train,
+                rcond=None,
+            )
+
+            prediction = (
+                design_current @ coefficients
+            )
+            residuals.loc[
+                frame.index[current_location],
+                target_name,
+            ] = y_current - prediction
+
+    usable_columns = [
+        name
+        for name in residuals.columns
+        if residuals[name].notna().sum() >= 2
+        and residuals[name].std(ddof=0) > np.finfo(float).eps
+    ]
+
+    if not usable_columns:
+        raise ValueError(
+            "no valid rolling residual series could be estimated"
+        )
+
+    residuals = residuals.loc[:, usable_columns]
+
+    columns = min(columns, residuals.shape[1])
+    rows = int(np.ceil(residuals.shape[1] / columns))
+
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(5 * columns, 3.5 * rows),
+        squeeze=False,
+        sharex=True,
+    )
+
+    for axis, target_name in zip(
+        axes.flat,
+        residuals.columns,
+    ):
+        spread = residuals[target_name]
+        spread_mean = spread.mean()
+        spread_std = spread.std(ddof=0)
+
+        axis.plot(
+            spread.index,
+            spread,
+            linewidth=1.0,
+            label="Rolling residual",
+        )
+        axis.axhline(
+            spread_mean,
+            color="black",
+            linestyle="--",
+            linewidth=0.9,
+            label="Mean",
+        )
+        axis.axhline(
+            spread_mean + 2.0 * spread_std,
+            color="tab:red",
+            linestyle=":",
+            linewidth=0.9,
+            label="±2σ",
+        )
+        axis.axhline(
+            spread_mean - 2.0 * spread_std,
+            color="tab:red",
+            linestyle=":",
+            linewidth=0.9,
+        )
+
+        latest = spread.dropna()
+        latest_zscore = (
+            (latest.iloc[-1] - spread_mean) / spread_std
+        )
+
+        axis.set_title(
+            f"{target_name} rolling spread\n"
+            f"Latest z = {latest_zscore:.2f}"
+        )
+        axis.set_xlabel("Observation")
+        axis.set_ylabel("OLS residual")
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize="small")
+
+    for axis in axes.flat[residuals.shape[1]:]:
+        axis.set_visible(False)
+
+    figure.suptitle(
+        "Rolling Multi-Instrument OLS Residual Spreads",
+        y=1.01,
+    )
+    figure.tight_layout()
+
+    return residuals, figure, axes
 

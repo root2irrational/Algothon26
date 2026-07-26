@@ -2,14 +2,13 @@ import numpy as np
 
 
 # =============================================================================
-# Constants
+# Instruments and absolute position limits
 # =============================================================================
 
 N_INST = 51
-MAX_POS_ALGO, MAX_POS_ELSE = 100_000, 10_000
 
-ENABLE_PAIRS = True
-ENABLE_INDIVIDUAL = False
+MAX_POS_ALGO = 100_000
+MAX_POS_ELSE = 10_000
 
 INSTRUMENTS = [
     "ALGO", "AENO", "LSST", "SRNA", "ELLT", "AMRP", "OTCS", "HETT",
@@ -21,274 +20,517 @@ INSTRUMENTS = [
     "FARS", "MHRM", "EAFC",
 ]
 
+if len(INSTRUMENTS) != N_INST:
+    raise ValueError(
+        f"N_INST={N_INST}, but {len(INSTRUMENTS)} instruments were provided"
+    )
+
 
 # =============================================================================
-# Parameters
+# Strategy parameters
 # =============================================================================
 
-BET_POS_ALGO, BET_POS_ELSE = 10_000, 10_000
-PAIRS_WINDOW, PAIRS_THRESHOLD = 250, 0.0
+ENABLE_PAIRS = True
+ENABLE_INDIVIDUAL = True
 
-# Rank instruments by their return over this lookback.
-INDIVIDUAL_WINDOW = 20
+# Strategy-level dollar allocations.
+PAIR_BET = 10_000
 
-# Long this many winners and short the same number of losers.
-INDIVIDUAL_COUNT = 5
+MULTI_PAIR_BET_ALGO = 1_000
+MULTI_PAIR_BET = 10_000
 
-# Equal dollar exposure per selected instrument. Keeping this at or below
-# BET_POS_ELSE means ALGO and non-ALGO names can all receive equal notionals.
-INDIVIDUAL_DOLLARS_PER_ASSET = 1_000
+PAIRS_WINDOW = 250
+PAIRS_Z_LOWER = 0.0
+PAIRS_Z_UPPER = 10.0
+
+INDIVIDUAL_WINDOW = 250
+INDIVIDUAL_Z_LOWER = 0.0
+INDIVIDUAL_Z_UPPER = 10.0
+
+
+# =============================================================================
+# Instrument groups
+# =============================================================================
 
 ALL_PAIRS = [
-    ('MHRM', 'EAFC'), ('ACIX', 'ITPA'), ('EORC', 'NGTE'), ('AENO', 'NWIG'), 
-    ('SMAH', 'ILVX'), ('HUXZ', 'ACAC'), ('ALUT', 'CCNS'), ('ALGO', 'BENI'), 
-    ('NPCK', 'SRTX'), ('FWWG', 'BLBT'), ('SRNA', 'IHOZ'), ('CTGI', 'EELT'), 
-    ('HETT', 'ULXY'), ('RTTH', 'RRES'), ('MTNS', 'HTRK'), ('DUCT', 'GARI'), 
-    ('MSDP', 'SPLZ'), ('ELLT', 'DIHO'), ('RCRI', 'NAYO'), ('HRND', 'AETS'), 
-    ('MDGI', 'AGVF'), ('AMRP', 'FCSG'), ('LSST', 'HRET'), ('CUBO', 'ANSO'), ('OTCS', 'MMBT')
+    ("MHRM", "EAFC"),
+    ("ACIX", "ITPA"),
+    ("EORC", "NGTE"),
+    ("AENO", "NWIG"),
+    ("SMAH", "ILVX"),
+    ("HUXZ", "ACAC"),
+    ("ALUT", "CCNS"),
+    ("ALGO", "BENI"),
+    ("NPCK", "SRTX"),
+    ("FWWG", "BLBT"),
+    ("SRNA", "IHOZ"),
+    ("CTGI", "EELT"),
+    ("HETT", "ULXY"),
+    ("RTTH", "RRES"),
+    ("MTNS", "HTRK"),
+    ("DUCT", "GARI"),
+    ("MSDP", "SPLZ"),
+    ("ELLT", "DIHO"),
+    ("RCRI", "NAYO"),
+    ("HRND", "AETS"),
+    ("MDGI", "AGVF"),
+    ("AMRP", "FCSG"),
+    ("LSST", "HRET"),
+    ("CUBO", "ANSO"),
+    ("OTCS", "MMBT"),
 ]
 
 PAIRS_1 = [
-    ('MHRM', 'EAFC'), ('ACIX', 'ITPA'), ('EORC', 'NGTE'), ('AENO', 'NWIG'), 
-    ('SMAH', 'ILVX'), ('HUXZ', 'ACAC'), ('ALUT', 'CCNS'), ('FWWG', 'BLBT'), 
-    ('CTGI', 'EELT'), ('HETT', 'ULXY'), ('RTTH', 'RRES'), ('RCRI', 'NAYO'), 
+    ("MHRM", "EAFC"),
+    ("ACIX", "ITPA"),
+    ("EORC", "NGTE"),
+    ("AENO", "NWIG"),
+    ("SMAH", "ILVX"),
+    ("HUXZ", "ACAC"),
+    ("ALUT", "CCNS"),
+    ("FWWG", "BLBT"),
+    ("CTGI", "EELT"),
+    ("HETT", "ULXY"),
+    ("RTTH", "RRES"),
+    ("RCRI", "NAYO"),
 ]
 
 PAIRS = PAIRS_1
 
-INDEX = {name: i for i, name in enumerate(INSTRUMENTS)}
-PAIRED = {name for pair in PAIRS for name in pair}
+INDEX = {
+    name: index
+    for index, name in enumerate(INSTRUMENTS)
+}
 
-# The cross-sectional strategy trades instruments not already used by pairs.
+PAIRED = {
+    name
+    for pair in PAIRS
+    for name in pair
+}
+
+# ALGO is deliberately excluded from the individual strategy.
 INDIVIDUAL = [name for name in INSTRUMENTS if name not in PAIRED]
 
-currentPos = np.zeros(N_INST, dtype=int)
-
 
 # =============================================================================
-# Helpers
+# Position-sizing helpers
 # =============================================================================
 
-def position_limits(instrument_name):
-    """Return bet size and maximum dollar position for an instrument."""
+def absolute_dollar_limit(instrument_name):
+    """Return the overall absolute dollar-position limit."""
     return (
-        (BET_POS_ALGO, MAX_POS_ALGO)
+        MAX_POS_ALGO
         if instrument_name == "ALGO"
-        else (BET_POS_ELSE, MAX_POS_ELSE)
+        else MAX_POS_ELSE
     )
 
 
-def _within_limit(name, shares, price):
-    """Check whether an integer position respects its dollar limit."""
-    _, dollar_limit = position_limits(name)
-    return abs(shares * price) <= dollar_limit
+def pair_dollar_limit(instrument_name):
+    """Return the allowed dollar exposure for the pairs strategy."""
+    return min(
+        PAIR_BET,
+        absolute_dollar_limit(instrument_name),
+    )
 
 
-def _reduce_rounding_imbalance(target, prices, selected_names):
+def individual_dollar_limit(instrument_name):
+    """Return the allowed dollar exposure for the multi-OLS strategy."""
+    strategy_bet = (
+        MULTI_PAIR_BET_ALGO
+        if instrument_name == "ALGO"
+        else MULTI_PAIR_BET
+    )
+
+    return min(
+        strategy_bet,
+        absolute_dollar_limit(instrument_name),
+    )
+
+
+def validate_prices(prices):
+    """Validate and return the supplied price matrix."""
+    prices = np.asarray(prices, dtype=float)
+
+    if prices.ndim != 2 or prices.shape[0] != N_INST:
+        raise ValueError(
+            f"prices must have shape ({N_INST}, observations)"
+        )
+
+    return prices
+
+
+def cap_combined_positions(positions, prices):
     """
-    Reduce net dollar exposure created by integer-share rounding.
+    Enforce absolute dollar-position limits after combining strategies.
 
-    Exact dollar neutrality is generally impossible with integer shares at
-    different prices. This greedily makes one-share adjustments whenever they
-    reduce the absolute net exposure without breaching a position limit.
+    This protects against future configurations in which instruments appear
+    in multiple strategies or pairs.
     """
-    selected_indices = [INDEX[name] for name in selected_names]
-    current_prices = prices[selected_indices, -1]
+    positions = np.asarray(positions, dtype=int).copy()
 
-    for _ in range(100):
-        shares = target[selected_indices]
-        net_dollars = float(shares @ current_prices)
+    if prices.shape[1] == 0:
+        return np.zeros(N_INST, dtype=int)
 
-        best_improvement = 0.0
-        best_index = None
-        best_change = 0
+    for index, name in enumerate(INSTRUMENTS):
+        price = prices[index, -1]
 
-        for name, i, price in zip(
-            selected_names,
-            selected_indices,
-            current_prices,
-        ):
-            if net_dollars > 0:
-                # Reduce long exposure or increase short exposure.
-                change = -1
-            elif net_dollars < 0:
-                # Increase long exposure or reduce short exposure.
-                change = 1
-            else:
-                return
+        if not np.isfinite(price) or price <= 0.0:
+            positions[index] = 0
+            continue
 
-            proposed_shares = target[i] + change
+        maximum_quantity = int(
+            np.floor(
+                absolute_dollar_limit(name) / price
+            )
+        )
 
-            # Do not cross through zero and create an unintended position.
-            if target[i] > 0 and proposed_shares < 0:
-                continue
-            if target[i] < 0 and proposed_shares > 0:
-                continue
+        positions[index] = int(
+            np.clip(
+                positions[index],
+                -maximum_quantity,
+                maximum_quantity,
+            )
+        )
 
-            if not _within_limit(name, proposed_shares, price):
-                continue
-
-            new_net = net_dollars + change * price
-            improvement = abs(net_dollars) - abs(new_net)
-
-            if improvement > best_improvement:
-                best_improvement = improvement
-                best_index = i
-                best_change = change
-
-        if best_index is None:
-            return
-
-        target[best_index] += best_change
+    return positions
 
 
 # =============================================================================
-# Strategies
+# Pair strategy
 # =============================================================================
 
 def Trade_pairs(prices):
-    """Return target pair positions from rolling OLS residual mean reversion."""
+    """
+    Trade each configured pair using a rolling OLS residual z-score.
+
+    The previous PAIRS_WINDOW observations are used to fit:
+
+        y = alpha + beta*x + residual
+
+    Today's observation is excluded from the fit and used only to generate
+    the current residual signal.
+    """
+    prices = validate_prices(prices)
     target = np.zeros(N_INST, dtype=int)
-    WINDOW = PAIRS_WINDOW
-    if prices.shape[1] < WINDOW:
+
+    if (
+        PAIRS_WINDOW < 2
+        or PAIRS_Z_LOWER < 0.0
+        or PAIRS_Z_UPPER < PAIRS_Z_LOWER
+        or prices.shape[1] < PAIRS_WINDOW + 1
+    ):
         return target
 
     for y_name, x_name in PAIRS:
-        yi, xi = INDEX[y_name], INDEX[x_name]
-        y = prices[yi, -WINDOW:]
-        x = prices[xi, -WINDOW:]
+        yi = INDEX[y_name]
+        xi = INDEX[x_name]
+
+        y = prices[
+            yi,
+            -(PAIRS_WINDOW + 1):
+        ]
+        x = prices[
+            xi,
+            -(PAIRS_WINDOW + 1):
+        ]
 
         if (
-            not np.isfinite(x).all()
-            or not np.isfinite(y).all()
-            or np.any(x <= 0)
-            or np.any(y <= 0)
+            not np.isfinite(y).all()
+            or not np.isfinite(x).all()
+            or np.any(y <= 0.0)
+            or np.any(x <= 0.0)
         ):
             continue
 
-        xc = x - x.mean()
-        yc = y - y.mean()
-        variance = xc @ xc
+        y_train = y[:-1]
+        x_train = x[:-1]
 
-        if variance <= np.finfo(float).eps:
+        y_current = y[-1]
+        x_current = x[-1]
+
+        x_mean = np.mean(x_train)
+        y_mean = np.mean(y_train)
+
+        x_centered = x_train - x_mean
+        y_centered = y_train - y_mean
+
+        x_variance = x_centered @ x_centered
+
+        if x_variance <= np.finfo(float).eps:
             continue
 
-        beta = (xc @ yc) / variance
-        residual = yc - beta * xc
-        residual_std = residual.std()
+        beta = (
+            x_centered @ y_centered
+        ) / x_variance
+        intercept = y_mean - beta * x_mean
+
+        training_residuals = (
+            y_train
+            - intercept
+            - beta * x_train
+        )
+
+        residual_mean = np.mean(training_residuals)
+        residual_std = np.std(
+            training_residuals,
+            ddof=1,
+        )
 
         if (
             not np.isfinite(beta)
+            or not np.isfinite(intercept)
+            or not np.isfinite(residual_mean)
+            or not np.isfinite(residual_std)
             or residual_std <= np.finfo(float).eps
         ):
             continue
 
-        zscore = residual[-1] / residual_std
-
-        if abs(zscore) <= PAIRS_THRESHOLD:
-            continue
-
-        direction = -np.sign(zscore)
-        bet = min(
-            position_limits(y_name)[0],
-            position_limits(x_name)[0],
+        current_residual = (
+            y_current
+            - intercept
+            - beta * x_current
         )
 
-        # qx = -beta*qy, while keeping both dollar legs within `bet`.
-        scale = bet / max(y[-1], abs(beta) * x[-1])
+        zscore = (
+            current_residual - residual_mean
+        ) / residual_std
 
-        target[yi] = int(np.rint(direction * scale))
-        target[xi] = int(np.rint(-direction * beta * scale))
+        if not np.isfinite(zscore):
+            continue
 
-    return target
-
-
-def Trade_individual(prices):
-    """
-    Trade cross-sectional momentum with a dollar-neutral long/short portfolio.
-
-    Instruments are ranked by their INDIVIDUAL_WINDOW log return. The strategy
-    buys the top INDIVIDUAL_COUNT winners and shorts the same number of losers.
-    Every selected instrument receives the same target dollar exposure.
-    """
-    target = np.zeros(N_INST, dtype=int)
-
-    # A W-period return needs W + 1 prices.
-    if prices.shape[1] < INDIVIDUAL_WINDOW + 1:
-        return target
-
-    ranked = []
-
-    for name in INDIVIDUAL:
-        i = INDEX[name]
-        start_price = prices[i, -INDIVIDUAL_WINDOW - 1]
-        current_price = prices[i, -1]
-
-        if (
-            not np.isfinite(start_price)
-            or not np.isfinite(current_price)
-            or start_price <= 0
-            or current_price <= 0
+        if not (
+            PAIRS_Z_LOWER
+            <= abs(zscore)
+            <= PAIRS_Z_UPPER
         ):
             continue
 
-        momentum = np.log(current_price / start_price)
+        direction = int(-np.sign(zscore))
 
-        if np.isfinite(momentum):
-            ranked.append((momentum, name))
+        if direction == 0:
+            continue
 
-    if len(ranked) < 2:
-        return target
+        y_dollar_limit = pair_dollar_limit(y_name)
+        x_dollar_limit = pair_dollar_limit(x_name)
 
-    ranked.sort(key=lambda item: item[0])
-    count = min(
-        INDIVIDUAL_COUNT,
-        len(ranked) // 2,
-    )
+        # Residual position:
+        #
+        #     q_y = direction * scale
+        #     q_x = -direction * beta * scale
+        #
+        # Select the largest scale that respects both instruments'
+        # pair-strategy dollar limits.
+        possible_scales = [
+            y_dollar_limit / y_current,
+        ]
 
-    if count == 0:
-        return target
-
-    losers = [name for _, name in ranked[:count]]
-    winners = [name for _, name in ranked[-count:]]
-
-    for direction, names in ((-1, losers), (1, winners)):
-        for name in names:
-            i = INDEX[name]
-            current_price = prices[i, -1]
-            bet, dollar_limit = position_limits(name)
-
-            target_dollars = min(
-                INDIVIDUAL_DOLLARS_PER_ASSET,
-                bet,
-                dollar_limit,
+        if abs(beta) > np.finfo(float).eps:
+            possible_scales.append(
+                x_dollar_limit
+                / (abs(beta) * x_current)
             )
-            shares = int(target_dollars / current_price)
-            target[i] = direction * shares
 
-    selected = losers + winners
-    _reduce_rounding_imbalance(
-        target,
-        prices,
-        selected,
-    )
-    # target = -1*target
+        scale = min(possible_scales)
+
+        if not np.isfinite(scale) or scale <= 0.0:
+            continue
+
+        y_quantity = int(
+            np.rint(direction * scale)
+        )
+        x_quantity = int(
+            np.rint(-direction * beta * scale)
+        )
+
+        # Accumulate rather than overwrite, allowing for future overlapping
+        # pair definitions.
+        target[yi] += y_quantity
+        target[xi] += x_quantity
+
     return target
 
 
 # =============================================================================
-# Main
+# Multi-instrument individual strategy
 # =============================================================================
+
+def Trade_individual(prices):
+    """
+    For every instrument in INDIVIDUAL:
+
+    1. Use that instrument as the OLS target.
+    2. Use all other valid INDIVIDUAL instruments as predictors.
+    3. Fit on the previous INDIVIDUAL_WINDOW raw-price observations.
+    4. Calculate today's out-of-sample residual z-score.
+    5. Trade only the target instrument in the mean-reversion direction.
+
+    ALGO is excluded from INDIVIDUAL and therefore is neither a target nor
+    a predictor in this strategy.
+    """
+    prices = validate_prices(prices)
+    target = np.zeros(N_INST, dtype=int)
+
+    if (
+        INDIVIDUAL_WINDOW < 2
+        or INDIVIDUAL_Z_LOWER < 0.0
+        or INDIVIDUAL_Z_UPPER < INDIVIDUAL_Z_LOWER
+        or prices.shape[1] < INDIVIDUAL_WINDOW + 1
+    ):
+        return target
+
+    individual_indices = np.asarray(
+        [
+            INDEX[name]
+            for name in INDIVIDUAL
+        ],
+        dtype=int,
+    )
+
+    if len(individual_indices) < 2:
+        return target
+
+    history = prices[
+        individual_indices,
+        -(INDIVIDUAL_WINDOW + 1):
+    ]
+
+    valid = (
+        np.isfinite(history).all(axis=1)
+        & (history > 0.0).all(axis=1)
+    )
+    valid_locations = np.flatnonzero(valid)
+
+    if len(valid_locations) < 2:
+        return target
+
+    valid_indices = individual_indices[
+        valid_locations
+    ]
+    valid_history = history[
+        valid_locations
+    ]
+
+    number_of_instruments = len(valid_indices)
+
+    for target_location in range(number_of_instruments):
+        target_index = valid_indices[target_location]
+
+        predictor_locations = (
+            np.arange(number_of_instruments)
+            != target_location
+        )
+
+        y = valid_history[target_location]
+        X = valid_history[predictor_locations].T
+
+        y_train = y[:-1]
+        X_train = X[:-1]
+
+        y_current = y[-1]
+        X_current = X[-1]
+
+        number_of_parameters = (
+            X_train.shape[1] + 1
+        )
+
+        if len(y_train) <= number_of_parameters:
+            continue
+
+        design_train = np.column_stack(
+            [
+                np.ones(len(X_train)),
+                X_train,
+            ]
+        )
+
+        coefficients, _, rank, _ = np.linalg.lstsq(
+            design_train,
+            y_train,
+            rcond=None,
+        )
+
+        if (
+            rank < number_of_parameters
+            or not np.isfinite(coefficients).all()
+        ):
+            continue
+
+        fitted_train = (
+            design_train @ coefficients
+        )
+        training_residuals = (
+            y_train - fitted_train
+        )
+
+        residual_mean = np.mean(
+            training_residuals
+        )
+        residual_std = np.std(
+            training_residuals,
+            ddof=1,
+        )
+
+        if (
+            not np.isfinite(residual_mean)
+            or not np.isfinite(residual_std)
+            or residual_std <= np.finfo(float).eps
+        ):
+            continue
+
+        current_design = np.concatenate(
+            ([1.0], X_current)
+        )
+        predicted_current = (
+            current_design @ coefficients
+        )
+        current_residual = (
+            y_current - predicted_current
+        )
+
+        zscore = (
+            current_residual - residual_mean
+        ) / residual_std
+
+        if not np.isfinite(zscore):
+            continue
+
+        if not (
+            INDIVIDUAL_Z_LOWER
+            <= abs(zscore)
+            <= INDIVIDUAL_Z_UPPER
+        ):
+            continue
+
+        direction = int(-np.sign(zscore))
+
+        if direction == 0:
+            continue
+
+        name = INSTRUMENTS[target_index]
+        dollar_limit = individual_dollar_limit(name)
+
+        quantity = int(
+            np.floor(dollar_limit / y_current)
+        )
+
+        target[target_index] = (
+            direction * quantity
+        )
+
+    return target
+
+
+# =============================================================================
+# Main entry point
+# =============================================================================
+
+currentPos = np.zeros(N_INST, dtype=int)
+
 
 def getMyPosition(prcSoFar):
     global currentPos
 
-    prices = np.asarray(prcSoFar, dtype=float)
-
-    if prices.ndim != 2 or prices.shape[0] != N_INST:
-        raise ValueError(
-            f"prcSoFar must have shape ({N_INST}, observations)"
-        )
+    prices = validate_prices(prcSoFar)
 
     pair_positions = (
         Trade_pairs(prices)
@@ -302,5 +544,14 @@ def getMyPosition(prcSoFar):
         else np.zeros(N_INST, dtype=int)
     )
 
-    currentPos = pair_positions + individual_positions
+    combined_positions = (
+        pair_positions
+        + individual_positions
+    )
+
+    currentPos = cap_combined_positions(
+        combined_positions,
+        prices,
+    )
+
     return currentPos.copy()
