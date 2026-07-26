@@ -67,6 +67,9 @@ except (AttributeError, KeyError, ValueError):
 BACKTESTER_VERSION = "2.1.0"
 TRADING_DAYS_PER_YEAR = 250
 SCORE_DEFAULT_PARAM = 1.0
+DEFAULT_TEST_START_DAY = 500
+DEFAULT_TEST_END_DAY = 749
+DEFAULT_NUM_TEST_DAYS = DEFAULT_TEST_END_DAY - DEFAULT_TEST_START_DAY + 1
 
 DEFAULT_COMMISSION_RATE = 0.0001
 INSTRUMENT_0_COMMISSION_RATE = 0.00002
@@ -123,9 +126,9 @@ class BacktestConfig:
     strategy_file: Path | None = None
     position_function: str | None = None
 
-    start_day: int | None = None
-    end_day: int | None = None
-    num_test_days: int = 250
+    start_day: int | None = DEFAULT_TEST_START_DAY
+    end_day: int | None = DEFAULT_TEST_END_DAY
+    num_test_days: int = DEFAULT_NUM_TEST_DAYS
 
     include_instruments: tuple[InstrumentSelector, ...] | None = None
     exclude_instruments: tuple[InstrumentSelector, ...] | None = None
@@ -1443,6 +1446,8 @@ def print_report(result: BacktestResult) -> None:
     headline = [
         "score_2026",
         "score_2025",
+        "mean_pnl",
+        "stddev_pnl",
         "cumulative_pnl",
         "sharpe",
         "max_drawdown",
@@ -1519,9 +1524,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--position-function",
         help="Exact callback name; otherwise common names are tried.",
     )
-    parser.add_argument("--start-day", type=int)
-    parser.add_argument("--end-day", type=int)
-    parser.add_argument("--num-test-days", type=int, default=250)
+    parser.add_argument("--start-day", type=int, default=DEFAULT_TEST_START_DAY)
+    parser.add_argument("--end-day", type=int, default=DEFAULT_TEST_END_DAY)
+    parser.add_argument("--num-test-days", type=int, default=DEFAULT_NUM_TEST_DAYS)
 
     universe = parser.add_mutually_exclusive_group()
     universe.add_argument("--include", nargs="+", type=_parse_selector)
@@ -1770,6 +1775,8 @@ def compare_results(
     metrics = [
         "score_2026",
         "score_2025",
+        "mean_pnl",
+        "stddev_pnl",
         "cumulative_pnl",
         "sharpe",
         "max_drawdown",
@@ -2543,6 +2550,12 @@ def _overview_page(result: BacktestResult, low_memory: bool) -> None:
         [
             ("Score 2026", _number(_summary_value(result, "score_2026"), 4), "Official 2026 score"),
             ("Score 2025", _number(_summary_value(result, "score_2025"), 4), "Mean PnL minus 10% of volatility"),
+            ("Mean daily PnL", _money(_summary_value(result, "mean_pnl")), None),
+            (
+                "Daily PnL standard deviation",
+                _money(_summary_value(result, "stddev_pnl")),
+                "Population standard deviation (ddof=0)",
+            ),
             ("Cumulative PnL", _money(_summary_value(result, "cumulative_pnl")), None),
             ("Annualised Sharpe", _number(_summary_value(result, "sharpe"), 2), None),
             ("Maximum drawdown", _money(_summary_value(result, "max_drawdown")), None),
@@ -2653,7 +2666,11 @@ def _instrument_page(result: BacktestResult, low_memory: bool) -> None:
         [
             ("Cumulative PnL", _money(summary.get("cumulative_pnl")), None),
             ("Mean daily PnL", _money(summary.get("mean_pnl")), None),
-            ("Daily PnL volatility", _money(summary.get("stddev_pnl")), None),
+            (
+                "Daily PnL standard deviation",
+                _money(summary.get("stddev_pnl")),
+                "Population standard deviation (ddof=0)",
+            ),
             ("Sharpe", _number(summary.get("sharpe"), 2), None),
             ("Score 2026", _number(summary.get("score_2026"), 4), None),
             ("Score 2025", _number(summary.get("score_2025"), 4), None),
@@ -2856,6 +2873,8 @@ def _diagnostics_page(result: BacktestResult, low_memory: bool) -> None:
     stats = pd.DataFrame(
         {
             "Metric": [
+                "Mean daily PnL",
+                "Daily PnL standard deviation",
                 "Average winning day",
                 "Average losing day",
                 "Largest winning day",
@@ -2868,6 +2887,8 @@ def _diagnostics_page(result: BacktestResult, low_memory: bool) -> None:
                 "Approx. holding period",
             ],
             "Value": [
+                _money(_summary_value(result, "mean_pnl")),
+                _money(_summary_value(result, "stddev_pnl")),
                 _money(_summary_value(result, "average_winning_day")),
                 _money(_summary_value(result, "average_losing_day")),
                 _money(_summary_value(result, "largest_winning_day")),
@@ -3044,8 +3065,9 @@ def _sidebar_configuration() -> tuple[dict[str, Any] | None, bool]:
         preview_error = str(exc)
         st.sidebar.warning(f"Price preview unavailable: {preview_error}")
 
-    default_end = max(1, n_days - 1)
-    default_start = max(1, default_end - 249)
+    maximum_day = max(1, n_days - 1)
+    default_end = min(DEFAULT_TEST_END_DAY, maximum_day)
+    default_start = min(DEFAULT_TEST_START_DAY, default_end)
 
     with st.sidebar.form("backtest-configuration-form", clear_on_submit=False):
         run_name = st.text_input("Run name", value="Current run")
@@ -3057,14 +3079,14 @@ def _sidebar_configuration() -> tuple[dict[str, Any] | None, bool]:
         start_day = st.number_input(
             "First scored day",
             min_value=1,
-            max_value=default_end,
+            max_value=maximum_day,
             value=default_start,
             step=1,
         )
         end_day = st.number_input(
             "Last scored day",
             min_value=1,
-            max_value=default_end,
+            max_value=maximum_day,
             value=default_end,
             step=1,
         )
