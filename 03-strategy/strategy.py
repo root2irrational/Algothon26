@@ -95,6 +95,19 @@ PAIRS_1 = [
     ("RCRI", "NAYO"),
 ]
 
+PAIRS_2 = [
+    ("MHRM", "EAFC"),
+    ("ACIX", "ITPA"),
+    ("AENO", "NWIG"),
+    ("SMAH", "ILVX"),
+    ("HUXZ", "ACAC"),
+    ("FWWG", "BLBT"),
+    ("CTGI", "EELT"),
+    ("HETT", "ULXY"),
+    ("RTTH", "RRES"),
+    ("RCRI", "NAYO"),
+]
+
 PAIRS = PAIRS_1
 
 INDEX = {
@@ -108,9 +121,11 @@ PAIRED = {
     for name in pair
 }
 
-# ALGO is deliberately excluded from the individual strategy.
-INDIVIDUAL = [name for name in INSTRUMENTS if name not in PAIRED]
-
+# INDIVIDUAL = [name for name in INSTRUMENTS if name not in PAIRED]
+INDIVIDUAL = ['ALGO', 'SRNA', 'DUCT', 'NPCK', 'CUBO', 'GARI', 'IHOZ', 'BENI',
+              'ELLT', 'OTCS', 'ANSO', 'DIHO', 'HTRK', 'LSST', 'HRND',
+              'AMRP', 'AETS', 'FCSG', 'MSDP', 'SPLZ', 'MDGI', 'MTNS'
+              ]
 
 # =============================================================================
 # Position-sizing helpers
@@ -354,21 +369,21 @@ def Trade_pairs(prices):
 # Multi-instrument individual strategy
 # =============================================================================
 
-def Trade_individual(prices):
+def Trade_individual(prices, previous_positions):
     """
-    For every instrument in INDIVIDUAL:
+    Add each individual mean-reversion signal to the existing position.
 
-    1. Use that instrument as the OLS target.
-    2. Use all other valid INDIVIDUAL instruments as predictors.
-    3. Fit on the previous INDIVIDUAL_WINDOW raw-price observations.
-    4. Calculate today's out-of-sample residual z-score.
-    5. Trade only the target instrument in the mean-reversion direction.
-
-    ALGO is excluded from INDIVIDUAL and therefore is neither a target nor
-    a predictor in this strategy.
+    Positions are not clipped here. Apply position limits only after all
+    instruments and strategies have finished contributing their bets.
     """
     prices = validate_prices(prices)
-    target = np.zeros(N_INST, dtype=int)
+    position = np.asarray(previous_positions, dtype=int).copy()
+
+    if position.shape != (N_INST,):
+        raise ValueError(
+            f"previous_positions must have shape ({N_INST},), "
+            f"but received {position.shape}"
+        )
 
     if (
         INDIVIDUAL_WINDOW < 2
@@ -376,22 +391,19 @@ def Trade_individual(prices):
         or INDIVIDUAL_Z_UPPER < INDIVIDUAL_Z_LOWER
         or prices.shape[1] < INDIVIDUAL_WINDOW + 1
     ):
-        return target
+        return position
 
     individual_indices = np.asarray(
-        [
-            INDEX[name]
-            for name in INDIVIDUAL
-        ],
+        [INDEX[name] for name in INDIVIDUAL],
         dtype=int,
     )
 
     if len(individual_indices) < 2:
-        return target
+        return position
 
     history = prices[
         individual_indices,
-        -(INDIVIDUAL_WINDOW + 1):
+        -(INDIVIDUAL_WINDOW + 1):,
     ]
 
     valid = (
@@ -401,14 +413,10 @@ def Trade_individual(prices):
     valid_locations = np.flatnonzero(valid)
 
     if len(valid_locations) < 2:
-        return target
+        return position
 
-    valid_indices = individual_indices[
-        valid_locations
-    ]
-    valid_history = history[
-        valid_locations
-    ]
+    valid_indices = individual_indices[valid_locations]
+    valid_history = history[valid_locations]
 
     number_of_instruments = len(valid_indices)
 
@@ -416,8 +424,7 @@ def Trade_individual(prices):
         target_index = valid_indices[target_location]
 
         predictor_locations = (
-            np.arange(number_of_instruments)
-            != target_location
+            np.arange(number_of_instruments) != target_location
         )
 
         y = valid_history[target_location]
@@ -429,9 +436,7 @@ def Trade_individual(prices):
         y_current = y[-1]
         X_current = X[-1]
 
-        number_of_parameters = (
-            X_train.shape[1] + 1
-        )
+        number_of_parameters = X_train.shape[1] + 1
 
         if len(y_train) <= number_of_parameters:
             continue
@@ -455,16 +460,10 @@ def Trade_individual(prices):
         ):
             continue
 
-        fitted_train = (
-            design_train @ coefficients
-        )
-        training_residuals = (
-            y_train - fitted_train
-        )
+        fitted_train = design_train @ coefficients
+        training_residuals = y_train - fitted_train
 
-        residual_mean = np.mean(
-            training_residuals
-        )
+        residual_mean = np.mean(training_residuals)
         residual_std = np.std(
             training_residuals,
             ddof=1,
@@ -480,12 +479,8 @@ def Trade_individual(prices):
         current_design = np.concatenate(
             ([1.0], X_current)
         )
-        predicted_current = (
-            current_design @ coefficients
-        )
-        current_residual = (
-            y_current - predicted_current
-        )
+        predicted_current = current_design @ coefficients
+        current_residual = y_current - predicted_current
 
         zscore = (
             current_residual - residual_mean
@@ -513,12 +508,10 @@ def Trade_individual(prices):
             np.floor(dollar_limit / y_current)
         )
 
-        target[target_index] = (
-            direction * quantity
-        )
+        current_signal_bet = direction * quantity
+        position[target_index] += current_signal_bet
 
-    return target
-
+    return position
 
 # =============================================================================
 # Main entry point
@@ -532,25 +525,23 @@ def getMyPosition(prcSoFar):
 
     prices = validate_prices(prcSoFar)
 
-    pair_positions = (
-        Trade_pairs(prices)
-        if ENABLE_PAIRS
-        else np.zeros(N_INST, dtype=int)
-    )
+    # Start from the previously held positions.
+    position = np.asarray(currentPos, dtype=int).copy()
 
-    individual_positions = (
-        Trade_individual(prices)
-        if ENABLE_INDIVIDUAL
-        else np.zeros(N_INST, dtype=int)
-    )
+    # Add pair-strategy bets without clipping.
+    if ENABLE_PAIRS:
+        position += Trade_pairs(prices)
 
-    combined_positions = (
-        pair_positions
-        + individual_positions
-    )
+    # Trade_individual adds its bets to the supplied positions.
+    if ENABLE_INDIVIDUAL:
+        position = Trade_individual(
+            prices,
+            position,
+        )
 
+    # Clip only once, after all bets have been added.
     currentPos = cap_combined_positions(
-        combined_positions,
+        position,
         prices,
     )
 

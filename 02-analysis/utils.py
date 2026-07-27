@@ -22,7 +22,7 @@ from typing import Hashable
 
 import statsmodels.api as sm
 
-from scipy.cluster.hierarchy import dendrogram, leaves_list, linkage
+from scipy.cluster.hierarchy import dendrogram, leaves_list, linkage, fcluster
 from scipy.spatial.distance import squareform
 from scipy.stats import norm
 from sklearn.decomposition import PCA
@@ -2240,3 +2240,321 @@ def plot_rolling_multi_ols_spreads(
 
     return residuals, figure, axes
 
+@dataclass(frozen=True)
+class InstrumentBasketClusteringResult:
+    """Immutable result from instrument basket clustering."""
+
+    baskets: dict[int, tuple[Hashable, ...]]
+    membership: pd.Series
+    distance_matrix: pd.DataFrame
+    correlation_matrix: pd.DataFrame
+    linkage_matrix: np.ndarray
+    observations_used: int
+
+    def basket_for(self, instrument: Hashable) -> tuple[Hashable, ...]:
+        """Return the basket containing the requested instrument."""
+        if instrument not in self.membership.index:
+            raise KeyError(f"unknown instrument: {instrument!r}")
+
+        basket_id = int(self.membership.loc[instrument])
+        return self.baskets[basket_id]
+
+
+
+def cluster_instrument_baskets(
+    prices: pd.DataFrame,
+    *,
+    instruments: Sequence[Hashable] | None = None,
+    number_of_baskets: int | None = None,
+    distance_threshold: float | None = None,
+    lookback: int | None = None,
+    minimum_observations: int = 60,
+    return_method: ReturnMethod = "log",
+    correlation_method: Literal["pearson", "spearman"] = "spearman",
+    linkage_method: Literal["single", "complete", "average"] = "average",
+    correlation_weight: float = 0.85,
+    volatility_weight: float = 0.15,
+    correlation_shrinkage: float = 0.05,
+) -> InstrumentBasketClusteringResult:
+    """Cluster a selected collection of instruments into baskets."""
+    frame = _as_frame(prices, name="price")
+
+    if not frame.columns.is_unique:
+        raise ValueError("instrument names must be unique")
+
+    if instruments is not None:
+        if isinstance(instruments, (str, bytes)):
+            raise TypeError(
+                "instruments must be a sequence, not a single string"
+            )
+
+        selected_instruments = list(instruments)
+
+        if not selected_instruments:
+            raise ValueError("instruments must not be empty")
+
+        if len(selected_instruments) != len(set(selected_instruments)):
+            raise ValueError("instruments must not contain duplicates")
+
+        missing = [
+            instrument
+            for instrument in selected_instruments
+            if instrument not in frame.columns
+        ]
+
+        if missing:
+            raise KeyError(f"unknown instruments: {missing}")
+
+        frame = frame.loc[:, selected_instruments].copy()
+
+    number_of_instruments = frame.shape[1]
+
+    if number_of_instruments < 2:
+        raise ValueError("at least two instruments are required")
+
+    if (number_of_baskets is None) == (distance_threshold is None):
+        raise ValueError(
+            "provide exactly one of number_of_baskets or "
+            "distance_threshold"
+        )
+
+    if number_of_baskets is not None:
+        number_of_baskets = _positive_int(
+            number_of_baskets,
+            name="number_of_baskets",
+        )
+
+        if number_of_baskets > number_of_instruments:
+            raise ValueError(
+                "number_of_baskets cannot exceed the number "
+                "of selected instruments"
+            )
+
+    if distance_threshold is not None:
+        distance_threshold = float(distance_threshold)
+
+        if (
+            not np.isfinite(distance_threshold)
+            or distance_threshold <= 0.0
+        ):
+            raise ValueError(
+                "distance_threshold must be positive and finite"
+            )
+
+    minimum_observations = _positive_int(
+        minimum_observations,
+        name="minimum_observations",
+    )
+
+    if lookback is not None:
+        lookback = _positive_int(
+            lookback,
+            name="lookback",
+        )
+
+        if lookback < 2:
+            raise ValueError("lookback must be at least 2")
+
+        frame = frame.iloc[-lookback:].copy()
+
+    if return_method == "log" and (frame <= 0.0).any().any():
+        raise ValueError(
+            "log returns require all available prices to be positive"
+        )
+
+    weights = np.asarray(
+        [correlation_weight, volatility_weight],
+        dtype=float,
+    )
+
+    if (
+        not np.isfinite(weights).all()
+        or (weights < 0.0).any()
+        or weights.sum() <= 0.0
+    ):
+        raise ValueError(
+            "distance weights must be finite, non-negative "
+            "and not both zero"
+        )
+
+    weights /= weights.sum()
+
+    correlation_shrinkage = float(correlation_shrinkage)
+
+    if (
+        not np.isfinite(correlation_shrinkage)
+        or not 0.0 <= correlation_shrinkage < 1.0
+    ):
+        raise ValueError(
+            "correlation_shrinkage must lie in [0, 1)"
+        )
+
+    returns = _as_frame(
+        calculate_returns(
+            frame,
+            method=return_method,
+            dropna=False,
+        ),
+        name="return",
+    ).dropna(how="any")
+
+    if len(returns) < minimum_observations:
+        raise ValueError(
+            "insufficient complete return observations: "
+            f"required {minimum_observations}, received {len(returns)}"
+        )
+
+    return_values = returns.to_numpy(dtype=float)
+
+    if not np.isfinite(return_values).all():
+        raise ValueError("returns contain non-finite values")
+
+    volatility = returns.std(axis=0, ddof=1)
+
+    invalid_volatility = (
+        ~np.isfinite(volatility)
+        | (volatility <= np.finfo(float).eps)
+    )
+
+    if invalid_volatility.any():
+        invalid_names = volatility.index[
+            invalid_volatility
+        ].tolist()
+
+        raise ValueError(
+            "instruments with zero or invalid return volatility: "
+            f"{invalid_names}"
+        )
+
+    sample_correlation = returns.corr(
+        method=correlation_method
+    )
+
+    if not np.isfinite(sample_correlation.to_numpy()).all():
+        raise ValueError(
+            "correlation matrix contains non-finite values"
+        )
+
+    correlation = sample_correlation.to_numpy(dtype=float)
+
+    correlation = (
+        (1.0 - correlation_shrinkage) * correlation
+        + correlation_shrinkage * np.eye(number_of_instruments)
+    )
+    correlation = (correlation + correlation.T) / 2.0
+    correlation = np.clip(correlation, -1.0, 1.0)
+    np.fill_diagonal(correlation, 1.0)
+
+    correlation_frame = pd.DataFrame(
+        correlation,
+        index=frame.columns,
+        columns=frame.columns,
+    )
+
+    correlation_distance = np.sqrt(
+        np.clip(
+            (1.0 - correlation) / 2.0,
+            0.0,
+            1.0,
+        )
+    )
+
+    log_volatility = np.log(
+        volatility.to_numpy(dtype=float)
+    )
+
+    volatility_distance = np.abs(
+        log_volatility[:, None]
+        - log_volatility[None, :]
+    )
+
+    maximum_volatility_distance = volatility_distance.max()
+
+    if maximum_volatility_distance > np.finfo(float).eps:
+        volatility_distance /= maximum_volatility_distance
+    else:
+        volatility_distance.fill(0.0)
+
+    combined_distance = (
+        weights[0] * correlation_distance
+        + weights[1] * volatility_distance
+    )
+
+    combined_distance = (
+        combined_distance + combined_distance.T
+    ) / 2.0
+    combined_distance = np.clip(
+        combined_distance,
+        0.0,
+        None,
+    )
+    np.fill_diagonal(combined_distance, 0.0)
+
+    if not np.isfinite(combined_distance).all():
+        raise ValueError(
+            "calculated distance matrix contains non-finite values"
+        )
+
+    distance_frame = pd.DataFrame(
+        combined_distance,
+        index=frame.columns,
+        columns=frame.columns,
+    )
+
+    linkage_matrix = linkage(
+        squareform(combined_distance, checks=True),
+        method=linkage_method,
+        optimal_ordering=True,
+    )
+
+    if number_of_baskets is not None:
+        raw_labels = fcluster(
+            linkage_matrix,
+            t=number_of_baskets,
+            criterion="maxclust",
+        )
+    else:
+        raw_labels = fcluster(
+            linkage_matrix,
+            t=distance_threshold,
+            criterion="distance",
+        )
+
+    label_mapping: dict[int, int] = {}
+    stable_labels = np.empty(
+        number_of_instruments,
+        dtype=int,
+    )
+
+    for location, raw_label in enumerate(raw_labels):
+        raw_label = int(raw_label)
+
+        if raw_label not in label_mapping:
+            label_mapping[raw_label] = len(label_mapping)
+
+        stable_labels[location] = label_mapping[raw_label]
+
+    membership = pd.Series(
+        stable_labels,
+        index=frame.columns.copy(),
+        name="basket_id",
+        dtype=int,
+    )
+
+    baskets = {
+        basket_id: tuple(
+            membership.index[
+                membership == basket_id
+            ].tolist()
+        )
+        for basket_id in sorted(membership.unique())
+    }
+
+    return InstrumentBasketClusteringResult(
+        baskets=baskets,
+        membership=membership,
+        distance_matrix=distance_frame,
+        correlation_matrix=correlation_frame,
+        linkage_matrix=linkage_matrix.copy(),
+        observations_used=len(returns),
+    )
