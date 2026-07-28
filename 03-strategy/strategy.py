@@ -1,5 +1,5 @@
 import numpy as np
-
+import pandas as pd
 
 # =============================================================================
 # Instruments and absolute position limits
@@ -30,13 +30,13 @@ if len(INSTRUMENTS) != N_INST:
 # Strategy parameters
 # =============================================================================
 
-ENABLE_PAIRS = True
+ENABLE_PAIRS = False
 ENABLE_INDIVIDUAL = True
 
 # Strategy-level dollar allocations.
 PAIR_BET = 10_000
 
-MULTI_PAIR_BET_ALGO = 1_000
+MULTI_PAIR_BET_ALGO = 1_0
 MULTI_PAIR_BET = 10_000
 
 PAIRS_WINDOW = 250
@@ -47,6 +47,9 @@ INDIVIDUAL_WINDOW = 250
 INDIVIDUAL_Z_LOWER = 0.0
 INDIVIDUAL_Z_UPPER = 10.0
 
+EMA_WINDOW = 100
+EMA_MOMENTUM_Z_THRESHOLD = 0.000001
+LOOKBACK = 20
 
 # =============================================================================
 # Instrument groups
@@ -121,11 +124,8 @@ PAIRED = {
     for name in pair
 }
 
-# INDIVIDUAL = [name for name in INSTRUMENTS if name not in PAIRED]
-INDIVIDUAL = ['ALGO', 'SRNA', 'DUCT', 'NPCK', 'CUBO', 'GARI', 'IHOZ', 'BENI',
-              'ELLT', 'OTCS', 'ANSO', 'DIHO', 'HTRK', 'LSST', 'HRND',
-              'AMRP', 'AETS', 'FCSG', 'MSDP', 'SPLZ', 'MDGI', 'MTNS'
-              ]
+INDIVIDUAL = [name for name in INSTRUMENTS if name not in PAIRED]
+
 
 # =============================================================================
 # Position-sizing helpers
@@ -513,6 +513,107 @@ def Trade_individual(prices, previous_positions):
 
     return position
 
+def Trade_individual_2(prices, previous_positions):
+    """
+    Trade the current EMA trend only when EMA trend-following was profitable
+    over the historical LOOKBACK period.
+    """
+    prices = validate_prices(prices)
+    position = np.asarray(previous_positions, dtype=int).copy()
+
+    if position.shape != (N_INST,):
+        raise ValueError(
+            f"previous_positions must have shape ({N_INST},), "
+            f"but received {position.shape}"
+        )
+
+    if (
+        isinstance(EMA_WINDOW, bool)
+        or not isinstance(EMA_WINDOW, (int, np.integer))
+        or EMA_WINDOW < 2
+        or isinstance(LOOKBACK, bool)
+        or not isinstance(LOOKBACK, (int, np.integer))
+        or LOOKBACK < 2
+    ):
+        return position
+
+    required_observations = EMA_WINDOW + LOOKBACK + 1
+
+    if prices.shape[1] < required_observations:
+        return position
+
+    for name in INDIVIDUAL:
+        instrument_index = INDEX[name]
+
+        history = prices[
+            instrument_index,
+            -required_observations:
+        ]
+
+        if (
+            not np.isfinite(history).all()
+            or np.any(history <= 0.0)
+        ):
+            continue
+
+        ema = (
+            pd.Series(history)
+            .ewm(
+                span=EMA_WINDOW,
+                adjust=False,
+            )
+            .mean()
+            .to_numpy()
+        )
+
+        # Historical trend signals:
+        # price above EMA -> +1
+        # price below EMA -> -1
+        historical_signals = np.sign(
+            history[EMA_WINDOW:-1]
+            - ema[EMA_WINDOW:-1]
+        )
+
+        next_returns = np.diff(
+            np.log(history)
+        )[EMA_WINDOW:]
+
+        active = historical_signals != 0
+
+        if not np.any(active):
+            continue
+
+        trend_score = np.mean(
+            historical_signals[active]
+            * next_returns[active]
+        )
+
+        # Do not trade unless trend following worked over LOOKBACK.
+        if not np.isfinite(trend_score) or trend_score <= 0.0:
+            continue
+
+        direction = int(
+            np.sign(history[-1] - ema[-1])
+        )
+
+        if direction == 0:
+            continue
+
+        current_price = history[-1]
+
+        quantity = int(
+            np.floor(
+                individual_dollar_limit(name)
+                / current_price
+            )
+        )
+
+        if quantity <= 0:
+            continue
+
+        position[instrument_index] += direction * quantity
+
+    return position
 # =============================================================================
 # Main entry point
 # =============================================================================
@@ -534,7 +635,7 @@ def getMyPosition(prcSoFar):
 
     # Trade_individual adds its bets to the supplied positions.
     if ENABLE_INDIVIDUAL:
-        position = Trade_individual(
+        position = Trade_individual_2(
             prices,
             position,
         )
