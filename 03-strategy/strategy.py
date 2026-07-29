@@ -30,15 +30,15 @@ if len(INSTRUMENTS) != N_INST:
 # Strategy parameters
 # =============================================================================
 
-ENABLE_PAIRS = False
-ENABLE_INDIVIDUAL = True
+ENABLE_PAIRS = True
+ENABLE_INDIVIDUAL = False
 
 # Strategy-level dollar allocations.
-PAIR_BET = 10_000
-
-MULTI_PAIR_BET_ALGO = 1_0
+MULTI_PAIR_BET_ALGO = 1_000
 MULTI_PAIR_BET = 10_000
 
+PAIR_BET = 10_000
+PAIR_BET_ALGO = 100_000
 PAIRS_WINDOW = 250
 PAIRS_Z_LOWER = 0.0
 PAIRS_Z_UPPER = 10.0
@@ -101,17 +101,21 @@ PAIRS_1 = [
 PAIRS_2 = [
     ("MHRM", "EAFC"),
     ("ACIX", "ITPA"),
+    ("EORC", "NGTE"),
     ("AENO", "NWIG"),
     ("SMAH", "ILVX"),
     ("HUXZ", "ACAC"),
+    ("ALUT", "CCNS"),
+    ("ALGO", "BENI"),
+    ("NPCK", "SRTX"),
     ("FWWG", "BLBT"),
+    ("SRNA", "IHOZ"),
     ("CTGI", "EELT"),
-    ("HETT", "ULXY"),
-    ("RTTH", "RRES"),
-    ("RCRI", "NAYO"),
+    ("HETT", "ULXY")
 ]
 
 PAIRS = PAIRS_1
+PAIRS = PAIRS_2
 
 INDEX = {
     name: index
@@ -142,6 +146,12 @@ def absolute_dollar_limit(instrument_name):
 
 def pair_dollar_limit(instrument_name):
     """Return the allowed dollar exposure for the pairs strategy."""
+    if instrument_name == "ALGO":
+        return min(
+        PAIR_BET_ALGO,
+        absolute_dollar_limit(instrument_name),
+    )
+
     return min(
         PAIR_BET,
         absolute_dollar_limit(instrument_name),
