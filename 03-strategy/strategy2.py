@@ -1,24 +1,29 @@
-"""SIG Algothon strategy: pairs plus an EMA-correlation regime."""
+"""SIG Algothon pairs and multi-instrument residual strategy."""
 
 import numpy as np
-import pandas as pd
+from sklearn.linear_model import Ridge
 
 
-N_INSTRUMENTS = 51
+N_INST = 51
 ALGO_INDEX = 0
-ALGO_LIMIT = 100_000.0
-STANDARD_LIMIT = 10_000.0
-
-EMA_WINDOW = 20
-CORR_THRESHOLD = 0.75
-MIN_CORR_GROUP_SIZE = 20
+MAX_POS_ALGO = 100_000.0
+MAX_POS_ELSE = 10_000.0
 
 ENABLE_PAIRS = True
 ENABLE_INDIVIDUAL = True
 
+PAIR_BET = 10_000.0
+MULTI_PAIR_BET_ALGO = 1_000.0
+MULTI_PAIR_BET = 10_000.0
+
 PAIRS_WINDOW = 250
 PAIRS_Z_LOWER = 0.0
 PAIRS_Z_UPPER = 10.0
+
+INDIVIDUAL_WINDOW = 250
+INDIVIDUAL_RIDGE_ALPHA = 0.05
+INDIVIDUAL_Z_LOWER = 0.0
+INDIVIDUAL_Z_UPPER = 10.0
 
 INSTRUMENTS = (
     "ALGO", "AENO", "LSST", "SRNA", "ELLT", "AMRP", "OTCS", "HETT",
@@ -45,191 +50,174 @@ PAIRS = (
     ("RCRI", "NAYO"),
 )
 
+if len(INSTRUMENTS) != N_INST:
+    raise RuntimeError(f"Expected {N_INST} instruments.")
+
 INDEX = {name: index for index, name in enumerate(INSTRUMENTS)}
-PAIRED_INDICES = frozenset(INDEX[name] for pair in PAIRS for name in pair)
-INDIVIDUAL_INDICES = tuple(
-    index for index in range(N_INSTRUMENTS) if index not in PAIRED_INDICES
+PAIR_INDICES = tuple((INDEX[y], INDEX[x]) for y, x in PAIRS)
+PAIRED = frozenset(index for pair in PAIR_INDICES for index in pair)
+INDIVIDUAL_INDICES = np.array(
+    [index for index in range(N_INST) if index not in PAIRED],
+    dtype=int,
 )
 
-if len(INSTRUMENTS) != N_INSTRUMENTS:
-    raise RuntimeError("Instrument configuration must contain 51 instruments.")
-
-def _validate_prices(prices):
-    """Return a validated floating-point price matrix."""
-    matrix = np.asarray(prices, dtype=float)
-    if matrix.ndim != 2 or matrix.shape[0] != N_INSTRUMENTS:
-        raise ValueError(
-            f"prices must have shape ({N_INSTRUMENTS}, observations)"
-        )
-    return matrix
+ABSOLUTE_LIMITS = np.full(N_INST, MAX_POS_ELSE)
+ABSOLUTE_LIMITS[ALGO_INDEX] = MAX_POS_ALGO
+PAIR_LIMITS = np.minimum(ABSOLUTE_LIMITS, PAIR_BET)
+INDIVIDUAL_LIMITS = np.minimum(ABSOLUTE_LIMITS, MULTI_PAIR_BET)
+INDIVIDUAL_LIMITS[ALGO_INDEX] = min(
+    MAX_POS_ALGO,
+    MULTI_PAIR_BET_ALGO,
+)
 
 
-def _dollar_limit(index):
-    return ALGO_LIMIT if index == ALGO_INDEX else STANDARD_LIMIT
-
-
-def _quantity_for_limit(index, price):
-    """Return the largest whole-share quantity inside the dollar limit."""
-    if not np.isfinite(price) or price <= 0.0:
-        return 0
-    return int(np.floor(_dollar_limit(index) / price))
+def _prices(prices):
+    prices = np.asarray(prices, dtype=float)
+    if prices.ndim != 2 or prices.shape[0] != N_INST:
+        raise ValueError(f"prices must have shape ({N_INST}, observations)")
+    return prices
 
 
 def Trade_pairs(prices):
-    """Return rolling-OLS residual mean-reversion targets for the 12 pairs."""
-    prices = _validate_prices(prices)
-    target = np.zeros(N_INSTRUMENTS, dtype=np.int64)
+    """Trade configured pairs using out-of-sample OLS residual z-scores."""
+    prices = _prices(prices)
+    positions = np.zeros(N_INST, dtype=np.int64)
+    if (
+        PAIRS_WINDOW < 2
+        or PAIRS_Z_LOWER < 0
+        or PAIRS_Z_UPPER < PAIRS_Z_LOWER
+        or prices.shape[1] <= PAIRS_WINDOW
+    ):
+        return positions
 
-    if prices.shape[1] < PAIRS_WINDOW + 1:
-        return target
-
-    epsilon = np.finfo(float).eps
-
-    for y_name, x_name in PAIRS:
-        y_index = INDEX[y_name]
-        x_index = INDEX[x_name]
-        y = prices[y_index, -(PAIRS_WINDOW + 1):]
-        x = prices[x_index, -(PAIRS_WINDOW + 1):]
-
-        if (
-            not np.isfinite(y).all()
-            or not np.isfinite(x).all()
-            or np.any(y <= 0.0)
-            or np.any(x <= 0.0)
-        ):
+    for y_index, x_index in PAIR_INDICES:
+        pair = prices[[y_index, x_index], -(PAIRS_WINDOW + 1):]
+        if not np.isfinite(pair).all() or np.any(pair <= 0):
             continue
 
-        y_train, y_current = y[:-1], y[-1]
-        x_train, x_current = x[:-1], x[-1]
-        x_centered = x_train - x_train.mean()
-        x_variance = x_centered @ x_centered
-        if x_variance <= epsilon:
+        y, x = pair[:, :-1]
+        if np.ptp(x) <= np.finfo(float).eps:
             continue
 
-        beta = (x_centered @ (y_train - y_train.mean())) / x_variance
-        intercept = y_train.mean() - beta * x_train.mean()
-        residuals = y_train - intercept - beta * x_train
+        beta, intercept = np.polyfit(x, y, 1)
+        residuals = y - (intercept + beta * x)
         residual_std = residuals.std(ddof=1)
-        if not np.isfinite(residual_std) or residual_std <= epsilon:
-            continue
-
-        current_residual = y_current - intercept - beta * x_current
-        z_score = (current_residual - residuals.mean()) / residual_std
         if (
-            not np.isfinite(z_score)
-            or not PAIRS_Z_LOWER <= abs(z_score) <= PAIRS_Z_UPPER
+            not np.isfinite(residual_std)
+            or residual_std <= np.finfo(float).eps
         ):
             continue
 
-        direction = int(-np.sign(z_score))
+        current = pair[:, -1]
+        current_residual = current[0] - (intercept + beta * current[1])
+        z_score = (current_residual - residuals.mean()) / residual_std
+        if not np.isfinite(z_score) or not (
+            PAIRS_Z_LOWER <= abs(z_score) <= PAIRS_Z_UPPER
+        ):
+            continue
+
+        direction = -np.sign(z_score)
         if direction == 0:
             continue
 
-        scales = [_dollar_limit(y_index) / y_current]
-        if abs(beta) > epsilon:
-            scales.append(_dollar_limit(x_index) / (abs(beta) * x_current))
-        scale = min(scales)
-        if not np.isfinite(scale) or scale <= 0.0:
-            continue
+        scale = PAIR_LIMITS[y_index] / current[0]
+        if abs(beta) > np.finfo(float).eps:
+            scale = min(
+                scale,
+                PAIR_LIMITS[x_index] / (abs(beta) * current[1]),
+            )
+        positions[y_index] += round(direction * scale)
+        positions[x_index] += round(-direction * beta * scale)
 
-        target[y_index] += int(np.rint(direction * scale))
-        target[x_index] += int(np.rint(-direction * beta * scale))
-
-    return target
-
-
-def _correlation_regime_directions(prices):
-    """Return directions for the largest qualifying EMA-correlation group."""
-    directions = np.zeros(N_INSTRUMENTS, dtype=np.int8)
-    individual_indices = np.asarray(INDIVIDUAL_INDICES, dtype=int)
-    history = prices[individual_indices]
-    valid = np.isfinite(history).all(axis=1) & (history > 0.0).all(axis=1)
-    valid_indices = individual_indices[valid]
-
-    if valid_indices.size < 2:
-        return directions
-
-    smoothed_prices = (
-        pd.DataFrame(prices[valid_indices].T)
-        .ewm(span=EMA_WINDOW, adjust=False)
-        .mean()
-        .to_numpy()
-        .T
-    )
-    recent_ema = smoothed_prices[:, -(EMA_WINDOW + 1):]
-    ema_returns = np.diff(np.log(recent_ema), axis=1)
-    varying = ema_returns.std(axis=1) > np.finfo(float).eps
-
-    if np.count_nonzero(varying) < 2:
-        return directions
-
-    active_indices = valid_indices[varying]
-    active_ema = recent_ema[varying]
-    correlation = np.corrcoef(ema_returns[varying])
-    np.fill_diagonal(correlation, -np.inf)
-
-    related = correlation >= CORR_THRESHOLD
-    anchor = int(np.argmax(related.sum(axis=1)))
-    group_locations = np.flatnonzero(related[anchor])
-    group_locations = np.unique(np.append(group_locations, anchor))
-
-    if group_locations.size < MIN_CORR_GROUP_SIZE:
-        return directions
-
-    group_moves = np.log(
-        active_ema[group_locations, -1]
-        / active_ema[group_locations, 0]
-    )
-    common_direction = int(np.sign(np.median(group_moves)))
-    if common_direction == 0:
-        return directions
-
-    aligned = np.sign(group_moves) == common_direction
-    directions[active_indices[group_locations[aligned]]] = common_direction
-    return directions
+    return positions
 
 
 def Trade_individual(prices):
-    """Trade an EMA-correlation regime; remain flat without one."""
-    prices = _validate_prices(prices)
-    target = np.zeros(N_INSTRUMENTS, dtype=np.int64)
+    """Trade each target's Ridge residual against all other valid instruments."""
+    prices = _prices(prices)
+    positions = np.zeros(N_INST, dtype=np.int64)
+    if (
+        INDIVIDUAL_WINDOW < 2
+        or INDIVIDUAL_RIDGE_ALPHA < 0
+        or INDIVIDUAL_Z_LOWER < 0
+        or INDIVIDUAL_Z_UPPER < INDIVIDUAL_Z_LOWER
+        or prices.shape[1] <= INDIVIDUAL_WINDOW
+    ):
+        return positions
 
-    if prices.shape[1] < EMA_WINDOW + 1:
-        return target
+    history = prices[
+        INDIVIDUAL_INDICES,
+        -(INDIVIDUAL_WINDOW + 1):,
+    ]
+    valid = np.isfinite(history).all(axis=1) & (history > 0).all(axis=1)
+    indices, history = INDIVIDUAL_INDICES[valid], history[valid]
+    if len(indices) < 2:
+        return positions
 
-    directions = _correlation_regime_directions(prices)
-    if not np.any(directions):
-        return target
+    for target_location, target_index in enumerate(indices):
+        predictors = np.arange(len(indices)) != target_location
+        y, X = history[target_location], history[predictors].T
+        model = Ridge(
+            alpha=INDIVIDUAL_RIDGE_ALPHA,
+            fit_intercept=True,
+            solver="svd",
+        ).fit(X[:-1], y[:-1])
 
-    for index in np.flatnonzero(directions):
-        current_price = prices[index, -1]
-        quantity = _quantity_for_limit(index, current_price)
-        target[index] = int(directions[index]) * quantity
+        residuals = y[:-1] - model.predict(X[:-1])
+        residual_std = residuals.std(ddof=1)
+        if (
+            not np.isfinite(residual_std)
+            or residual_std <= np.finfo(float).eps
+        ):
+            continue
 
-    return target
+        current_residual = y[-1] - model.predict(X[-1:])[0]
+        z_score = (current_residual - residuals.mean()) / residual_std
+        if not np.isfinite(z_score) or not (
+            INDIVIDUAL_Z_LOWER <= abs(z_score) <= INDIVIDUAL_Z_UPPER
+        ):
+            continue
+
+        direction = -np.sign(z_score)
+        if direction:
+            quantity = np.floor(
+                INDIVIDUAL_LIMITS[target_index] / y[-1]
+            )
+            positions[target_index] = round(direction * quantity)
+
+    return positions
 
 
 def _cap_positions(positions, prices):
-    """Enforce the current-price dollar limit for every instrument."""
-    capped = np.asarray(positions, dtype=np.int64).copy()
     if prices.shape[1] == 0:
-        return np.zeros(N_INSTRUMENTS, dtype=np.int64)
+        return np.zeros(N_INST, dtype=np.int64)
 
-    for index, price in enumerate(prices[:, -1]):
-        maximum = _quantity_for_limit(index, price)
-        capped[index] = np.clip(capped[index], -maximum, maximum)
-    return capped
+    current = prices[:, -1]
+    valid = np.isfinite(current) & (current > 0)
+    maximum = np.zeros(N_INST, dtype=np.int64)
+    maximum[valid] = np.floor(
+        ABSOLUTE_LIMITS[valid] / current[valid]
+    ).astype(np.int64)
+    return np.clip(
+        np.asarray(positions, dtype=np.int64),
+        -maximum,
+        maximum,
+    )
+
+
+currentPos = np.zeros(N_INST, dtype=np.int64)
 
 
 def getMyPosition(prcSoFar):
-    """Return today's desired total positions for the Algothon evaluator."""
-    prices = _validate_prices(prcSoFar)
-    positions = np.zeros(N_INSTRUMENTS, dtype=np.int64)
+    """Return combined target positions for the evaluator."""
+    global currentPos
 
+    prices = _prices(prcSoFar)
+    positions = np.zeros(N_INST, dtype=np.int64)
     if ENABLE_PAIRS:
         positions += Trade_pairs(prices)
-
     if ENABLE_INDIVIDUAL:
         positions += Trade_individual(prices)
 
-    return _cap_positions(positions, prices)
+    currentPos = _cap_positions(positions, prices)
+    return currentPos.copy()

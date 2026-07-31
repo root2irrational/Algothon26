@@ -25,14 +25,16 @@ import statsmodels.api as sm
 from scipy.cluster.hierarchy import dendrogram, leaves_list, linkage, fcluster
 from scipy.spatial.distance import squareform
 from scipy.stats import norm
-from sklearn.decomposition import PCA
 
+from sklearn.decomposition import PCA
 from sklearn.linear_model import LassoCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
 from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.tsa.stattools import adfuller
 
 DataLike: TypeAlias = pd.Series | pd.DataFrame | np.ndarray
 ReturnMethod: TypeAlias = Literal["simple", "log", "difference"]
@@ -759,65 +761,159 @@ __all__ = [
 def pair_instruments(
     prices: pd.DataFrame,
     *,
+    instruments: Sequence[object] | None = None,
     correlation_weight: float = 0.7,
     volatility_weight: float = 0.3,
     correlation_method: Literal["pearson", "spearman"] = "pearson",
     linkage_method: Literal["single", "complete", "average"] = "average",
     ax: Axes | None = None,
 ) -> list[tuple[object, object]]:
-    """Plot a dendrogram and return disjoint pairs with minimum mixed distance."""
-    if prices.shape[1] < 2:
-        raise ValueError("prices must contain at least two instruments")
+    """Cluster selected instruments and return disjoint closest pairs.
+
+    When ``instruments`` is provided, every calculation—including returns,
+    correlations, volatility distances, hierarchical clustering, the
+    dendrogram, and pair selection—is restricted to those instruments.
+
+    If ``instruments`` is ``None``, all columns in ``prices`` are used.
+    """
+    if not isinstance(prices, pd.DataFrame):
+        raise TypeError("prices must be a pandas DataFrame")
+    if prices.empty:
+        raise ValueError("prices must not be empty")
     if not prices.columns.is_unique:
-        raise ValueError("instrument names must be unique")
+        raise ValueError("price columns must be unique")
+
+    if instruments is None:
+        selected_prices = prices.copy()
+    else:
+        if isinstance(instruments, (str, bytes)):
+            raise TypeError(
+                "instruments must be a sequence of instrument names, "
+                "not a single string"
+            )
+
+        selected_instruments = list(instruments)
+
+        if len(selected_instruments) < 2:
+            raise ValueError(
+                "instruments must contain at least two instruments"
+            )
+        if len(set(selected_instruments)) != len(selected_instruments):
+            raise ValueError("instruments must not contain duplicates")
+
+        missing = [
+            instrument
+            for instrument in selected_instruments
+            if instrument not in prices.columns
+        ]
+        if missing:
+            raise KeyError(f"unknown instruments: {missing}")
+
+        selected_prices = prices.loc[:, selected_instruments].copy()
+
+    if selected_prices.shape[1] < 2:
+        raise ValueError(
+            "at least two instruments are required for clustering"
+        )
+
+    if correlation_method not in {"pearson", "spearman"}:
+        raise ValueError(
+            "correlation_method must be 'pearson' or 'spearman'"
+        )
+    if linkage_method not in {"single", "complete", "average"}:
+        raise ValueError(
+            "linkage_method must be 'single', 'complete', or 'average'"
+        )
 
     weights = np.asarray(
         [correlation_weight, volatility_weight],
         dtype=float,
     )
-    if not np.isfinite(weights).all() or (weights < 0).any() or weights.sum() == 0:
-        raise ValueError("weights must be finite, non-negative, and not both zero")
+
+    if (
+        not np.isfinite(weights).all()
+        or (weights < 0).any()
+        or weights.sum() <= 0
+    ):
+        raise ValueError(
+            "weights must be finite, non-negative, and not both zero"
+        )
+
     weights /= weights.sum()
 
+    try:
+        selected_prices = selected_prices.astype(float)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "selected price columns must contain numeric values"
+        ) from exc
+
+    values = selected_prices.to_numpy()
+
+    if np.isinf(values).any():
+        raise ValueError("selected prices must not contain infinite values")
+    if (selected_prices <= 0).any().any():
+        raise ValueError("selected prices must be strictly positive")
+
     returns = (
-        prices.astype(float)
+        selected_prices
         .pct_change(fill_method=None)
         .dropna(how="any")
     )
-    if len(returns) < 2:
-        raise ValueError("insufficient complete return observations")
 
-    correlation = returns.corr(method=correlation_method).to_numpy()
-    volatility = returns.std(ddof=1).to_numpy()
+    if len(returns) < 2:
+        raise ValueError(
+            "selected instruments have insufficient complete return history"
+        )
+
+    correlation = returns.corr(
+        method=correlation_method
+    ).to_numpy(dtype=float)
+
+    volatility = returns.std(ddof=1).to_numpy(dtype=float)
 
     if not np.isfinite(correlation).all():
-        raise ValueError("correlation contains invalid values")
+        raise ValueError(
+            "selected instruments produced invalid correlations"
+        )
     if not np.isfinite(volatility).all() or (volatility <= 0).any():
-        raise ValueError("each instrument must have positive finite volatility")
+        raise ValueError(
+            "every selected instrument must have positive finite volatility"
+        )
 
-    # High positive correlation produces a small distance.
+    # Highly positively correlated instruments have a small distance.
     correlation_distance = np.sqrt(
         np.clip((1.0 - correlation) / 2.0, 0.0, 1.0)
     )
 
     # Instruments with similar proportional volatility have a small distance.
     log_volatility = np.log(volatility)
+
     volatility_distance = np.abs(
         log_volatility[:, None] - log_volatility[None, :]
     )
-    if (scale := volatility_distance.max()) > 0:
-        volatility_distance /= scale
+
+    maximum_volatility_distance = volatility_distance.max()
+
+    if maximum_volatility_distance > 0:
+        volatility_distance /= maximum_volatility_distance
 
     distance = (
         weights[0] * correlation_distance
         + weights[1] * volatility_distance
     )
+
+    # Protect linkage from small numerical asymmetries.
     distance = (distance + distance.T) / 2.0
     np.fill_diagonal(distance, 0.0)
 
-    # Dendrogram visualization.
+    condensed_distance = squareform(
+        distance,
+        checks=True,
+    )
+
     tree = linkage(
-        squareform(distance, checks=True),
+        condensed_distance,
         method=linkage_method,
         optimal_ordering=True,
     )
@@ -827,23 +923,27 @@ def pair_instruments(
 
     dendrogram(
         tree,
-        labels=[str(column) for column in prices.columns],
+        labels=[
+            str(instrument)
+            for instrument in selected_prices.columns
+        ],
         leaf_rotation=90,
         leaf_font_size=9,
         ax=ax,
     )
-    ax.set_title("Instrument Clusters")
+
+    ax.set_title("Selected Instrument Clusters")
     ax.set_xlabel("Instrument")
     ax.set_ylabel("Combined distance")
     ax.grid(axis="y", alpha=0.25)
     ax.figure.tight_layout()
 
-    # Select closest available pairs from the actual distance matrix.
+    # Find the closest non-overlapping pairs using only selected instruments.
     candidates = sorted(
         (
-            (distance[i, j], i, j)
-            for i in range(prices.shape[1])
-            for j in range(i + 1, prices.shape[1])
+            (distance[first, second], first, second)
+            for first in range(selected_prices.shape[1])
+            for second in range(first + 1, selected_prices.shape[1])
         ),
         key=lambda candidate: candidate[0],
     )
@@ -852,11 +952,16 @@ def pair_instruments(
     used: set[int] = set()
 
     for _, first, second in candidates:
-        if first not in used and second not in used:
-            pairs.append(
-                (prices.columns[first], prices.columns[second])
+        if first in used or second in used:
+            continue
+
+        pairs.append(
+            (
+                selected_prices.columns[first],
+                selected_prices.columns[second],
             )
-            used.update((first, second))
+        )
+        used.update((first, second))
 
     return pairs
 
@@ -2558,3 +2663,15 @@ def cluster_instrument_baskets(
         linkage_matrix=linkage_matrix.copy(),
         observations_used=len(returns),
     )
+
+
+__all__ = [
+    "PCAFitResult",
+    "ResidualBacktestResult",
+    "RollingPCAResult",
+    "backtest_residual_zscores",
+    "fit_pca_residuals",
+    "plot_pca_overview",
+    "plot_residual_diagnostics",
+    "residual_mean_reversion_diagnostics",
+    "rolling_pca_residuals",]
