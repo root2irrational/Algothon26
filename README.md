@@ -1,6 +1,8 @@
 # Algothon 2026
 
 Research, strategy development, backtesting, and visualisation for the SIG × UNSW FinTech Society Algothon 2026.
+Team Name: E=mc^2+ai
+General Round: Score 182, rank 186. Did not proceed to finals.
 
 ## Structure
 
